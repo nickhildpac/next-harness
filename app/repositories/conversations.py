@@ -2,7 +2,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Conversation, ConversationSummary, Message, MessageRole
+from app.db.models import Conversation, ConversationKind, ConversationSummary, Message, MessageRole
 
 
 class ConversationRepository:
@@ -16,22 +16,35 @@ class ConversationRepository:
         title: str | None,
         tone_name: str,
         custom_persona: str | None,
+        second_user_id: str | None = None,
+        kind: str = ConversationKind.assistant.value,
     ) -> Conversation:
         conversation = Conversation(
-            user_id=user_id, title=title, tone_name=tone_name, custom_persona=custom_persona
+            user_id=user_id,
+            title=title,
+            tone_name=tone_name,
+            custom_persona=custom_persona,
+            second_user_id=second_user_id,
+            kind=kind,
         )
         self.session.add(conversation)
         await self.session.flush()
         return conversation
 
-    async def get(self, conversation_id: str, user_id: str | None = None) -> Conversation | None:
+    async def get(self, conversation_id: str) -> Conversation | None:
+        stmt = (
+            select(Conversation)
+            .options(selectinload(Conversation.summary))
+            .where(Conversation.id == conversation_id, Conversation.is_archived.is_(False))
+        )
+        return await self.session.scalar(stmt)
+
+    async def get_with_messages(self, conversation_id: str) -> Conversation | None:
         stmt = (
             select(Conversation)
             .options(selectinload(Conversation.messages), selectinload(Conversation.summary))
             .where(Conversation.id == conversation_id, Conversation.is_archived.is_(False))
         )
-        if user_id:
-            stmt = stmt.where(Conversation.user_id == user_id)
         return await self.session.scalar(stmt)
 
     async def list_all(self) -> list[Conversation]:
@@ -86,7 +99,7 @@ class ConversationRepository:
         stmt = (
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at.asc())
+            .order_by(Message.created_at.asc(), Message.id.asc())
             .limit(limit)
             .offset(offset)
         )
@@ -97,7 +110,7 @@ class ConversationRepository:
         stmt = (
             select(Message)
             .where(Message.conversation_id == conversation_id, Message.role != MessageRole.summary)
-            .order_by(Message.created_at.desc())
+            .order_by(Message.created_at.desc(), Message.id.desc())
             .limit(limit)
         )
         return list(reversed(list(await self.session.scalars(stmt))))
@@ -110,7 +123,7 @@ class ConversationRepository:
         )
         if covered_until:
             stmt = stmt.where(Message.created_at > covered_until)
-        stmt = stmt.order_by(Message.created_at.asc())
+        stmt = stmt.order_by(Message.created_at.asc(), Message.id.asc())
         return list(await self.session.scalars(stmt))
 
     async def upsert_summary(

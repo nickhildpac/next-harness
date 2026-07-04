@@ -16,5 +16,9 @@ class ToneService:
                 temperature=0.6,
                 top_p=0.9,
             )
-        return self.settings.tones[tone_name]
+        tone_definition = self.settings.tones.get(tone_name)
+        if tone_definition is None:
+            # A tone stored before a rename (or edited directly in the DB) must not break sends.
+            tone_definition = self.settings.tones["professional"]
+        return tone_definition
 

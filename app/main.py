@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,7 +14,11 @@ from app.db.session import create_db_and_tables
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_db_and_tables()
-    yield
+    app.state.http_client = httpx.AsyncClient()
+    try:
+        yield
+    finally:
+        await app.state.http_client.aclose()
 
 
 def create_app() -> FastAPI:

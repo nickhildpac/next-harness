@@ -1,4 +1,4 @@
-from app.db.models import Conversation
+from app.db.models import Conversation, ConversationKind, Message
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient
 from app.repositories.conversations import ConversationRepository
 from app.services.tokens import TokenCounter
@@ -43,6 +43,34 @@ class MemoryService:
             return self._trim_to_budget(messages)
         return messages
 
+    async def duo_context_messages(
+        self, conversation: Conversation, system_prompt: str, speak_as: str
+    ) -> list[ChatMessage]:
+        """Context for drafting a reply on behalf of `speak_as` in a two-user conversation.
+
+        The target user's own messages are mapped to the assistant role (the voice being
+        generated) and the other participant's messages to the user role.
+        """
+        messages = [ChatMessage(role="system", content=system_prompt)]
+        if conversation.summary:
+            messages.append(
+                ChatMessage(
+                    role="system",
+                    content=f"Conversation summary so far: {conversation.summary.content}",
+                )
+            )
+        recent = await self.repo.recent_messages(conversation.id, self.window_turn_count * 2)
+        messages.extend(
+            ChatMessage(
+                role="assistant" if message.user_id == speak_as else "user",
+                content=message.content,
+            )
+            for message in recent
+        )
+        if self.token_counter.count_messages(messages) > self.context_budget:
+            return self._trim_to_budget(messages)
+        return messages
+
     async def summarize_if_needed(self, conversation: Conversation) -> None:
         unsummarized = await self.repo.unsummarized_messages(conversation)
         token_total = sum(message.token_count for message in unsummarized)
@@ -51,7 +79,7 @@ class MemoryService:
 
         existing = conversation.summary.content if conversation.summary else ""
         transcript = "\n".join(
-            f"{self._role_value(message.role)}: {message.content}"
+            f"{self._speaker_label(conversation, message)}: {message.content}"
             for message in unsummarized[:-2]
         )
         prompt = [
@@ -96,3 +124,9 @@ class MemoryService:
 
     def _role_value(self, role) -> str:
         return role.value if hasattr(role, "value") else role
+
+    def _speaker_label(self, conversation: Conversation, message: Message) -> str:
+        # In two-user conversations both sides have role "user"; label by participant instead.
+        if conversation.kind == ConversationKind.duo:
+            return message.user_id
+        return self._role_value(message.role)

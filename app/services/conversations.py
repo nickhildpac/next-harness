@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -6,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.db.models import Conversation, MessageRole
+from app.db.models import Conversation, ConversationKind, Message, MessageRole
 from app.orchestration.chat_graph import ChatGraph
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, LLMResult
 from app.repositories.conversations import ConversationRepository
@@ -19,6 +20,8 @@ from app.schemas.conversation import (
     MessageCreate,
     MessageResponse,
     PaginatedMessages,
+    SuggestRequest,
+    SuggestResponse,
 )
 from app.services.memory import MemoryService
 from app.services.tokens import TokenCounter
@@ -48,11 +51,19 @@ class ConversationService:
         self.graph = ChatGraph(llm)
 
     async def create(self, payload: ConversationCreate) -> ConversationResponse:
+        if payload.participants:
+            user_id, second_user_id = payload.participants
+            kind = ConversationKind.duo.value
+        else:
+            user_id, second_user_id = payload.user_id, None
+            kind = ConversationKind.assistant.value
         conversation = await self.repo.create(
-            user_id=payload.user_id,
+            user_id=user_id,
             title=payload.title,
             tone_name=payload.tone.tone_name,
             custom_persona=payload.tone.custom_persona,
+            second_user_id=second_user_id,
+            kind=kind,
         )
         await self.session.commit()
         return ConversationResponse.model_validate(conversation)
@@ -62,7 +73,7 @@ class ConversationService:
         return [ConversationResponse.model_validate(conversation) for conversation in conversations]
 
     async def get(self, conversation_id: str) -> ConversationDetail:
-        conversation = await self._conversation_or_404(conversation_id)
+        conversation = await self._conversation_or_404(conversation_id, with_messages=True)
         return ConversationDetail(
             **ConversationResponse.model_validate(conversation).model_dump(),
             messages=[self._message_response(message) for message in conversation.messages],
@@ -96,7 +107,15 @@ class ConversationService:
 
     async def send_message(self, conversation_id: str, payload: MessageCreate) -> ChatResponse:
         conversation = await self._conversation_or_404(conversation_id)
+        if conversation.kind == ConversationKind.duo:
+            return await self._send_duo_message(conversation, payload)
         user_id = self._message_user_id(conversation, payload)
+        tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
+        # Build context before persisting the new message so it appears exactly once,
+        # and so a context-budget rejection leaves nothing behind in the DB.
+        context = await self.memory.context_messages(conversation, tone.system_template)
+        context.append(ChatMessage(role="user", content=payload.content))
+        self._guard_context(context)
         user_message = await self.repo.add_message(
             conversation_id=conversation.id,
             user_id=user_id,
@@ -104,10 +123,6 @@ class ConversationService:
             content=payload.content,
             token_count=self.token_counter.count(payload.content),
         )
-        tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
-        context = await self.memory.context_messages(conversation, tone.system_template)
-        context.append(ChatMessage(role="user", content=payload.content))
-        self._guard_context(context)
         result = await self._generate(context, tone.temperature, tone.top_p)
         assistant_message = await self.repo.add_message(
             conversation_id=conversation.id,
@@ -139,7 +154,19 @@ class ConversationService:
     ) -> AsyncIterator[str]:
         try:
             conversation = await self._conversation_or_404(conversation_id)
+            if conversation.kind == ConversationKind.duo:
+                response = await self._send_duo_message(conversation, payload)
+                yield self._sse("message", {"role": "user", "id": response.user_message.id})
+                yield self._sse("done", {"user_message_id": response.user_message.id})
+                yield "data: [DONE]\n\n"
+                return
             user_id = self._message_user_id(conversation, payload)
+            tone = self.tones.resolve(
+                payload.tone_override, conversation.tone_name, conversation.custom_persona
+            )
+            context = await self.memory.context_messages(conversation, tone.system_template)
+            context.append(ChatMessage(role="user", content=payload.content))
+            self._guard_context(context)
             user_message = await self.repo.add_message(
                 conversation_id=conversation.id,
                 user_id=user_id,
@@ -147,31 +174,29 @@ class ConversationService:
                 content=payload.content,
                 token_count=self.token_counter.count(payload.content),
             )
-            tone = self.tones.resolve(
-                payload.tone_override, conversation.tone_name, conversation.custom_persona
-            )
-            context = await self.memory.context_messages(conversation, tone.system_template)
-            context.append(ChatMessage(role="user", content=payload.content))
-            self._guard_context(context)
+            # Commit before streaming so the user message survives a client disconnect.
+            await self.session.commit()
             params = GenerationParams(
                 model=self.settings.default_model,
                 temperature=tone.temperature,
                 top_p=tone.top_p,
                 timeout_seconds=self.settings.request_timeout_seconds,
             )
+            model = self.llm.resolve_model(params)
             chunks: list[str] = []
             yield self._sse("message", {"role": "user", "id": user_message.id})
-            async for chunk in self.llm.stream_chat(context, params):
-                chunks.append(chunk)
-                yield self._sse("delta", {"delta": chunk})
+            try:
+                async for chunk in self.llm.stream_chat(context, params):
+                    chunks.append(chunk)
+                    yield self._sse("delta", {"delta": chunk})
+            except (GeneratorExit, asyncio.CancelledError):
+                # Client disconnected mid-stream; keep whatever partial reply arrived.
+                if chunks:
+                    await self._persist_assistant(conversation.id, user_id, "".join(chunks), model)
+                raise
             content = "".join(chunks)
-            assistant_message = await self.repo.add_message(
-                conversation_id=conversation.id,
-                user_id=user_id,
-                role=MessageRole.assistant,
-                content=content,
-                token_count=self.token_counter.count(content),
-                model=self.settings.default_model,
+            assistant_message = await self._persist_assistant(
+                conversation.id, user_id, content, model, commit=False
             )
             await self.memory.summarize_if_needed(conversation)
             await self.session.commit()
@@ -209,6 +234,114 @@ class ConversationService:
                 detail="Local LLM is unavailable or timed out.",
             ) from exc
 
+    async def suggest_reply(self, conversation_id: str, payload: SuggestRequest) -> SuggestResponse:
+        conversation = await self._conversation_or_404(conversation_id)
+        if conversation.kind != ConversationKind.duo:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reply suggestions are only available for two-user conversations.",
+            )
+        participants = self._participants(conversation)
+        if payload.for_user not in participants:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="for_user must be one of the conversation participants.",
+            )
+        tone = self.tones.resolve(
+            payload.tone_override, conversation.tone_name, conversation.custom_persona
+        )
+        other_user = next(p for p in participants if p != payload.for_user)
+        system_prompt = (
+            f"{tone.system_template}\n\n"
+            f"You are drafting the next chat message on behalf of '{payload.for_user}' in a "
+            f"conversation between '{participants[0]}' and '{participants[1]}'. "
+            f"Reply to '{other_user}' in the first person as '{payload.for_user}', staying "
+            "consistent with what they have said so far. "
+            "Write only the message text, with no name prefix or commentary."
+        )
+        context = await self.memory.duo_context_messages(
+            conversation, system_prompt, speak_as=payload.for_user
+        )
+        self._guard_context(context)
+        result = await self._generate(context, tone.temperature, tone.top_p)
+        message_response = None
+        if payload.persist:
+            message = await self.repo.add_message(
+                conversation_id=conversation.id,
+                user_id=payload.for_user,
+                role=MessageRole.user,
+                content=result.content,
+                token_count=result.output_tokens,
+                model=result.model,
+            )
+            await self.memory.summarize_if_needed(conversation)
+            await self.session.commit()
+            message_response = self._message_response(message)
+        logger.info(
+            "suggestion_completed",
+            extra={
+                "conversation_id": conversation.id,
+                "for_user": payload.for_user,
+                "persisted": payload.persist,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            },
+        )
+        return SuggestResponse(
+            conversation_id=conversation.id,
+            for_user=payload.for_user,
+            content=result.content,
+            model=result.model,
+            message=message_response,
+            token_usage={"input": result.input_tokens, "output": result.output_tokens},
+        )
+
+    async def _send_duo_message(
+        self, conversation: Conversation, payload: MessageCreate
+    ) -> ChatResponse:
+        user_id = self._message_user_id(conversation, payload)
+        if user_id not in self._participants(conversation):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="user_id must be one of the conversation participants.",
+            )
+        message = await self.repo.add_message(
+            conversation_id=conversation.id,
+            user_id=user_id,
+            role=MessageRole.user,
+            content=payload.content,
+            token_count=self.token_counter.count(payload.content),
+        )
+        await self.memory.summarize_if_needed(conversation)
+        await self.session.commit()
+        return ChatResponse(
+            conversation_id=conversation.id,
+            user_message=self._message_response(message),
+            assistant_message=None,
+            token_usage={"input": message.token_count, "output": 0},
+        )
+
+    def _participants(self, conversation: Conversation) -> list[str]:
+        participants = [conversation.user_id]
+        if conversation.second_user_id:
+            participants.append(conversation.second_user_id)
+        return participants
+
+    async def _persist_assistant(
+        self, conversation_id: str, user_id: str, content: str, model: str, *, commit: bool = True
+    ) -> Message:
+        message = await self.repo.add_message(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=MessageRole.assistant,
+            content=content,
+            token_count=self.token_counter.count(content),
+            model=model,
+        )
+        if commit:
+            await self.session.commit()
+        return message
+
     def _guard_context(self, messages: list[ChatMessage]) -> None:
         tokens = self.token_counter.count_messages(messages)
         if tokens > self.settings.context_token_budget:
@@ -218,9 +351,12 @@ class ConversationService:
             )
 
     async def _conversation_or_404(
-        self, conversation_id: str, user_id: str | None = None
+        self, conversation_id: str, *, with_messages: bool = False
     ) -> Conversation:
-        conversation = await self.repo.get(conversation_id, user_id)
+        if with_messages:
+            conversation = await self.repo.get_with_messages(conversation_id)
+        else:
+            conversation = await self.repo.get(conversation_id)
         if not conversation:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
         return conversation
@@ -229,6 +365,7 @@ class ConversationService:
         return MessageResponse(
             id=message.id,
             conversation_id=message.conversation_id,
+            user_id=message.user_id,
             role=message.role.value if hasattr(message.role, "value") else message.role,
             content=message.content,
             token_count=message.token_count,

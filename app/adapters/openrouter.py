@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -14,10 +15,27 @@ class OpenRouterUnavailable(RuntimeError):
 
 
 class OpenRouterClient(LLMClient):
-    def __init__(self, settings: Settings, token_counter: TokenCounter):
+    def __init__(
+        self,
+        settings: Settings,
+        token_counter: TokenCounter,
+        http_client: httpx.AsyncClient | None = None,
+    ):
         self.settings = settings
         self.token_counter = token_counter
         self.base_url = str(settings.openrouter_base_url).rstrip("/")
+        self._http = http_client
+
+    def resolve_model(self, params: GenerationParams) -> str:
+        return self.settings.openrouter_model
+
+    @asynccontextmanager
+    async def _client(self) -> AsyncIterator[httpx.AsyncClient]:
+        if self._http is not None:
+            yield self._http
+        else:
+            async with httpx.AsyncClient() as client:
+                yield client
 
     async def health(self) -> bool:
         return bool(self.settings.openrouter_api_key)
@@ -44,12 +62,13 @@ class OpenRouterClient(LLMClient):
         self, messages: list[ChatMessage], params: GenerationParams
     ) -> AsyncIterator[str]:
         payload = self._payload(messages, params, stream=True)
-        async with httpx.AsyncClient(timeout=params.timeout_seconds) as client:
+        async with self._client() as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url}/chat/completions",
                 headers=self._headers(),
                 json=payload,
+                timeout=params.timeout_seconds,
             ) as response:
                 if response.status_code >= 500:
                     raise OpenRouterUnavailable("OpenRouter returned an unavailable status")
@@ -68,11 +87,12 @@ class OpenRouterClient(LLMClient):
     async def _post_chat(
         self, messages: list[ChatMessage], params: GenerationParams, *, stream: bool
     ) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=params.timeout_seconds) as client:
+        async with self._client() as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers=self._headers(),
                 json=self._payload(messages, params, stream=stream),
+                timeout=params.timeout_seconds,
             )
         if response.status_code >= 500:
             raise OpenRouterUnavailable("OpenRouter returned an unavailable status")
