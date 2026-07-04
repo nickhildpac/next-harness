@@ -57,6 +57,10 @@ class ConversationService:
         await self.session.commit()
         return ConversationResponse.model_validate(conversation)
 
+    async def list_all(self) -> list[ConversationResponse]:
+        conversations = await self.repo.list_all()
+        return [ConversationResponse.model_validate(conversation) for conversation in conversations]
+
     async def get(self, conversation_id: str) -> ConversationDetail:
         conversation = await self._conversation_or_404(conversation_id)
         return ConversationDetail(
@@ -91,10 +95,11 @@ class ConversationService:
         )
 
     async def send_message(self, conversation_id: str, payload: MessageCreate) -> ChatResponse:
-        conversation = await self._conversation_or_404(conversation_id, payload.user_id)
+        conversation = await self._conversation_or_404(conversation_id)
+        user_id = self._message_user_id(conversation, payload)
         user_message = await self.repo.add_message(
             conversation_id=conversation.id,
-            user_id=payload.user_id,
+            user_id=user_id,
             role=MessageRole.user,
             content=payload.content,
             token_count=self.token_counter.count(payload.content),
@@ -106,7 +111,7 @@ class ConversationService:
         result = await self._generate(context, tone.temperature, tone.top_p)
         assistant_message = await self.repo.add_message(
             conversation_id=conversation.id,
-            user_id=payload.user_id,
+            user_id=user_id,
             role=MessageRole.assistant,
             content=result.content,
             token_count=result.output_tokens,
@@ -132,47 +137,62 @@ class ConversationService:
     async def stream_message(
         self, conversation_id: str, payload: MessageCreate
     ) -> AsyncIterator[str]:
-        conversation = await self._conversation_or_404(conversation_id, payload.user_id)
-        user_message = await self.repo.add_message(
-            conversation_id=conversation.id,
-            user_id=payload.user_id,
-            role=MessageRole.user,
-            content=payload.content,
-            token_count=self.token_counter.count(payload.content),
-        )
-        tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
-        context = await self.memory.context_messages(conversation, tone.system_template)
-        context.append(ChatMessage(role="user", content=payload.content))
-        self._guard_context(context)
-        params = GenerationParams(
-            model=self.settings.default_model,
-            temperature=tone.temperature,
-            top_p=tone.top_p,
-            timeout_seconds=self.settings.request_timeout_seconds,
-        )
-        chunks: list[str] = []
-        yield self._sse("message", {"role": "user", "id": user_message.id})
-        async for chunk in self.llm.stream_chat(context, params):
-            chunks.append(chunk)
-            yield self._sse("token", {"content": chunk})
-        content = "".join(chunks)
-        assistant_message = await self.repo.add_message(
-            conversation_id=conversation.id,
-            user_id=payload.user_id,
-            role=MessageRole.assistant,
-            content=content,
-            token_count=self.token_counter.count(content),
-            model=self.settings.default_model,
-        )
-        await self.memory.summarize_if_needed(conversation)
-        await self.session.commit()
-        yield self._sse(
-            "done",
-            {
-                "assistant_message_id": assistant_message.id,
-                "output_tokens": assistant_message.token_count,
-            },
-        )
+        try:
+            conversation = await self._conversation_or_404(conversation_id)
+            user_id = self._message_user_id(conversation, payload)
+            user_message = await self.repo.add_message(
+                conversation_id=conversation.id,
+                user_id=user_id,
+                role=MessageRole.user,
+                content=payload.content,
+                token_count=self.token_counter.count(payload.content),
+            )
+            tone = self.tones.resolve(
+                payload.tone_override, conversation.tone_name, conversation.custom_persona
+            )
+            context = await self.memory.context_messages(conversation, tone.system_template)
+            context.append(ChatMessage(role="user", content=payload.content))
+            self._guard_context(context)
+            params = GenerationParams(
+                model=self.settings.default_model,
+                temperature=tone.temperature,
+                top_p=tone.top_p,
+                timeout_seconds=self.settings.request_timeout_seconds,
+            )
+            chunks: list[str] = []
+            yield self._sse("message", {"role": "user", "id": user_message.id})
+            async for chunk in self.llm.stream_chat(context, params):
+                chunks.append(chunk)
+                yield self._sse("delta", {"delta": chunk})
+            content = "".join(chunks)
+            assistant_message = await self.repo.add_message(
+                conversation_id=conversation.id,
+                user_id=user_id,
+                role=MessageRole.assistant,
+                content=content,
+                token_count=self.token_counter.count(content),
+                model=self.settings.default_model,
+            )
+            await self.memory.summarize_if_needed(conversation)
+            await self.session.commit()
+            yield self._sse(
+                "done",
+                {
+                    "user_message_id": user_message.id,
+                    "assistant_message_id": assistant_message.id,
+                    "output_tokens": assistant_message.token_count,
+                },
+            )
+            yield "data: [DONE]\n\n"
+        except HTTPException as exc:
+            await self.session.rollback()
+            yield self._sse("error", {"error": exc.detail})
+            yield "data: [DONE]\n\n"
+        except Exception:
+            await self.session.rollback()
+            logger.exception("stream_message_failed", extra={"conversation_id": conversation_id})
+            yield self._sse("error", {"error": "Local LLM is unavailable or timed out."})
+            yield "data: [DONE]\n\n"
 
     async def _generate(self, messages: list[ChatMessage], temperature: float, top_p: float) -> LLMResult:
         params = GenerationParams(
@@ -216,6 +236,10 @@ class ConversationService:
             created_at=message.created_at,
         )
 
+    def _message_user_id(self, conversation: Conversation, payload: MessageCreate) -> str:
+        if payload.user_id == "anonymous":
+            return conversation.user_id
+        return payload.user_id
+
     def _sse(self, event: str, payload: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
-

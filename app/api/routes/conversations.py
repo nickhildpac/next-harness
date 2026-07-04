@@ -24,6 +24,13 @@ async def create_conversation(
     return await service.create(payload)
 
 
+@router.get("", response_model=list[ConversationResponse])
+async def list_conversations(
+    service: ConversationService = Depends(get_conversation_service),
+) -> list[ConversationResponse]:
+    return await service.list_all()
+
+
 @router.get("/{conversation_id}", response_model=ConversationDetail)
 async def get_conversation(
     conversation_id: str,
@@ -73,4 +80,3 @@ async def delete_conversation(
 ) -> Response:
     await service.archive(conversation_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-

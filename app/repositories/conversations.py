@@ -34,6 +34,14 @@ class ConversationRepository:
             stmt = stmt.where(Conversation.user_id == user_id)
         return await self.session.scalar(stmt)
 
+    async def list_all(self) -> list[Conversation]:
+        stmt = (
+            select(Conversation)
+            .where(Conversation.is_archived.is_(False))
+            .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
+        )
+        return list(await self.session.scalars(stmt))
+
     async def archive(self, conversation: Conversation) -> None:
         conversation.is_archived = True
         await self.session.flush()
@@ -123,4 +131,3 @@ class ConversationRepository:
         self.session.add(summary)
         await self.session.flush()
         return summary
-

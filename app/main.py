@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import conversations, health
+from app.api.routes import conversations, health, tones
 from app.core.config import get_settings
 from app.core.logging import RequestContextMiddleware, configure_logging
 from app.db.session import create_db_and_tables
@@ -20,9 +22,15 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.include_router(health.router)
+    app.include_router(tones.router)
     app.include_router(conversations.router)
+    app.mount("/app", StaticFiles(directory="app/static", html=True), name="app")
+
+    @app.get("/", include_in_schema=False)
+    async def index_redirect() -> RedirectResponse:
+        return RedirectResponse(url="/app/")
+
     return app
 
 
 app = create_app()
-

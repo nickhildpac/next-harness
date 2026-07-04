@@ -35,7 +35,10 @@ class MemoryService:
                 )
             )
         recent = await self.repo.recent_messages(conversation.id, self.window_turn_count * 2)
-        messages.extend(ChatMessage(role=message.role.value, content=message.content) for message in recent)
+        messages.extend(
+            ChatMessage(role=self._role_value(message.role), content=message.content)
+            for message in recent
+        )
         if self.token_counter.count_messages(messages) > self.context_budget:
             return self._trim_to_budget(messages)
         return messages
@@ -47,7 +50,10 @@ class MemoryService:
             return
 
         existing = conversation.summary.content if conversation.summary else ""
-        transcript = "\n".join(f"{message.role}: {message.content}" for message in unsummarized[:-2])
+        transcript = "\n".join(
+            f"{self._role_value(message.role)}: {message.content}"
+            for message in unsummarized[:-2]
+        )
         prompt = [
             ChatMessage(
                 role="system",
@@ -87,3 +93,6 @@ class MemoryService:
             if self.token_counter.count_messages(candidate) <= self.context_budget:
                 kept.insert(0, message)
         return required + kept
+
+    def _role_value(self, role) -> str:
+        return role.value if hasattr(role, "value") else role
