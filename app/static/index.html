@@ -617,7 +617,7 @@ function renderMain() {
   draftInput.focus();
   draftInput.setSelectionRange(draftInput.value.length, draftInput.value.length);
 
-  document.getElementById('sendBtn').addEventListener('click', sendMessage);
+  document.getElementById('sendBtn').addEventListener('click', () => sendMessage());
 }
 
 async function deleteConversation(id) {
