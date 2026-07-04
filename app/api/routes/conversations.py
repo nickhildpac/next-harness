@@ -84,6 +84,16 @@ async def list_messages(
     return await service.list_messages(conversation_id, limit, offset)
 
 
+@router.delete("/{conversation_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    conversation_id: str,
+    message_id: str,
+    service: ConversationService = Depends(get_conversation_service),
+) -> Response:
+    await service.delete_message(conversation_id, message_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(
     conversation_id: str,

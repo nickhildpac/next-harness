@@ -115,6 +115,16 @@ class ConversationRepository:
         )
         return list(reversed(list(await self.session.scalars(stmt))))
 
+    async def delete_message(self, message_id: str, conversation_id: str) -> bool:
+        stmt = select(Message).where(
+            Message.id == message_id, Message.conversation_id == conversation_id
+        )
+        message = await self.session.scalar(stmt)
+        if message is None:
+            return False
+        await self.session.delete(message)
+        return True
+
     async def unsummarized_messages(self, conversation: Conversation) -> list[Message]:
         covered_until = conversation.summary.covered_until if conversation.summary else None
         stmt = select(Message).where(

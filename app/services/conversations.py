@@ -95,6 +95,13 @@ class ConversationService:
         await self.repo.archive(conversation)
         await self.session.commit()
 
+    async def delete_message(self, conversation_id: str, message_id: str) -> None:
+        await self._conversation_or_404(conversation_id)
+        deleted = await self.repo.delete_message(message_id, conversation_id)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+        await self.session.commit()
+
     async def list_messages(self, conversation_id: str, limit: int, offset: int) -> PaginatedMessages:
         await self._conversation_or_404(conversation_id)
         messages, total = await self.repo.list_messages(conversation_id, limit=limit, offset=offset)
