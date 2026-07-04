@@ -57,6 +57,7 @@ class ConversationCreate(BaseModel):
     user_id: str = Field(default="anonymous", min_length=1, max_length=128)
     title: str | None = Field(default=None, max_length=255)
     tone: ToneConfig = Field(default_factory=ToneConfig)
+    participants: list[str] | None = Field(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -64,6 +65,18 @@ class ConversationCreate(BaseModel):
         if isinstance(data, dict) and "tone" in data and isinstance(data["tone"], str):
             return {**data, "tone": ToneConfig(tone_name=normalize_tone(data["tone"]))}
         return data
+
+    @field_validator("participants")
+    @classmethod
+    def validate_participants(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned = [participant.strip() for participant in value]
+        if len(cleaned) != 2 or len(set(cleaned)) != 2:
+            raise ValueError("participants must be exactly two distinct users")
+        if any(not participant or len(participant) > 128 for participant in cleaned):
+            raise ValueError("each participant must be 1-128 characters")
+        return cleaned
 
 
 class ConversationToneUpdate(ToneConfig):
@@ -75,6 +88,8 @@ class ConversationResponse(BaseModel):
 
     id: str
     user_id: str
+    second_user_id: str | None = None
+    kind: str = "assistant"
     title: str | None
     tone_name: str
     custom_persona: str | None
@@ -99,6 +114,7 @@ class MessageCreate(BaseModel):
 class MessageResponse(BaseModel):
     id: str
     conversation_id: str
+    user_id: str
     role: str
     content: str
     token_count: int
@@ -114,7 +130,32 @@ class ConversationDetail(ConversationResponse):
 class ChatResponse(BaseModel):
     conversation_id: str
     user_message: MessageResponse
-    assistant_message: MessageResponse
+    # None for two-user conversations, where the LLM only replies via /suggest.
+    assistant_message: MessageResponse | None = None
+    token_usage: dict[str, int]
+
+
+class SuggestRequest(BaseModel):
+    for_user: str = Field(min_length=1, max_length=128)
+    tone_override: ToneConfig | None = None
+    persist: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_user_aliases(cls, data):
+        if isinstance(data, dict) and "for_user" not in data:
+            for alias in ("as_user", "user_id"):
+                if alias in data:
+                    return {**data, "for_user": data[alias]}
+        return data
+
+
+class SuggestResponse(BaseModel):
+    conversation_id: str
+    for_user: str
+    content: str
+    model: str
+    message: MessageResponse | None = None
     token_usage: dict[str, int]
 
 

@@ -14,10 +14,19 @@ class MessageRole(str, Enum):
     summary = "summary"
 
 
+class ConversationKind(str, Enum):
+    assistant = "assistant"  # one user chatting with the LLM
+    duo = "duo"  # two users chatting; the LLM drafts replies on request
+
+
 class Conversation(Base, IdMixin, TimestampMixin):
     __tablename__ = "conversations"
 
     user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    second_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    kind: Mapped[str] = mapped_column(
+        String(32), default=ConversationKind.assistant.value, nullable=False
+    )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tone_name: Mapped[str] = mapped_column(String(64), default="professional", nullable=False)
     custom_persona: Mapped[str | None] = mapped_column(Text, nullable=True)
