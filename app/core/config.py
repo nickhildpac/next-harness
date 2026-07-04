@@ -19,13 +19,23 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "sqlite+aiosqlite:///./var/app.db"
 
-    llm_provider: Literal["openrouter", "ollama", "auto"] = "openrouter"
+    llm_provider: Literal[
+        "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"
+    ] = "openrouter"
     ollama_base_url: AnyHttpUrl = "http://localhost:11434"
     openrouter_base_url: AnyHttpUrl = "https://openrouter.ai/api/v1"
     openrouter_api_key: str | None = None
     openrouter_model: str = "openai/gpt-4o-mini"
     openrouter_site_url: str | None = None
     openrouter_app_name: str | None = None
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str | None = None
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-sonnet-4-5"
+    anthropic_max_tokens: int = 2048
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
     default_model: str = "llama3.1"
     request_timeout_seconds: float = 60.0
     llm_max_retries: int = 2

@@ -15,6 +15,7 @@ def test_openapi_contains_conversation_routes():
     assert "/conversations" in paths
     assert "/conversations/{conversation_id}/messages" in paths
     assert "/tones" in paths
+    assert "/providers" in paths
 
 
 def test_compatibility_payload_aliases():
@@ -64,3 +65,84 @@ def test_ollama_request_override_is_honored_even_with_openrouter_key():
     )
 
     assert isinstance(client, OllamaClient)
+
+
+def test_openai_provider_used_when_key_configured():
+    from app.adapters.openai import OpenAIClient
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    client = build_llm_client(
+        Settings(openai_api_key="test-key"),
+        provider="openai",
+    )
+
+    assert isinstance(client, OpenAIClient)
+
+
+def test_anthropic_provider_used_when_key_configured():
+    from app.adapters.anthropic import AnthropicClient
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    client = build_llm_client(
+        Settings(anthropic_api_key="test-key"),
+        provider="anthropic",
+    )
+
+    assert isinstance(client, AnthropicClient)
+
+
+def test_gemini_provider_used_when_key_configured():
+    from app.adapters.gemini import GeminiClient
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    client = build_llm_client(
+        Settings(gemini_api_key="test-key"),
+        provider="gemini",
+    )
+
+    assert isinstance(client, GeminiClient)
+
+
+def test_cloud_provider_falls_back_to_openrouter_when_key_missing():
+    from app.adapters.openrouter import OpenRouterClient
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    client = build_llm_client(
+        Settings(openai_api_key=None, openrouter_api_key="test-key"),
+        provider="openai",
+    )
+
+    assert isinstance(client, OpenRouterClient)
+
+
+def test_cloud_provider_falls_through_to_ollama_when_no_cloud_keys():
+    from app.adapters.ollama import OllamaClient
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    client = build_llm_client(
+        Settings(anthropic_api_key=None, openrouter_api_key=None),
+        provider="anthropic",
+    )
+
+    assert isinstance(client, OllamaClient)
+
+
+def test_providers_endpoint_reports_availability():
+    from app.api.routes.providers import list_providers
+    from app.core.config import Settings
+
+    import asyncio
+
+    result = asyncio.run(
+        list_providers(Settings(openai_api_key="k", anthropic_api_key=None))
+    )
+    by_id = {p["id"]: p for p in result}
+    assert by_id["openai"]["available"] is True
+    assert by_id["anthropic"]["available"] is False
+    assert by_id["ollama"]["available"] is True
+    assert set(by_id.keys()) == {"openrouter", "openai", "anthropic", "gemini", "ollama"}
