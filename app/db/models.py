@@ -68,3 +68,15 @@ class ConversationSummary(Base, IdMixin, TimestampMixin):
 
     conversation: Mapped[Conversation] = relationship(back_populates="summary")
 
+
+class Note(Base, IdMixin, TimestampMixin):
+    __tablename__ = "notes"
+    __table_args__ = (Index("ix_notes_user_updated", "user_id", "updated_at"),)
+
+    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    style_name: Mapped[str] = mapped_column(String(64), default="default", nullable=False)
+    custom_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+

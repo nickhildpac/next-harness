@@ -11,6 +11,7 @@ from app.core.config import Settings, get_settings
 from app.db.session import get_session
 from app.ports.llm import LLMClient
 from app.services.conversations import ConversationService
+from app.services.notes import NoteService
 from app.services.tokens import TokenCounter
 
 
@@ -57,3 +58,11 @@ async def get_conversation_service(
     llm: LLMClient = Depends(get_llm_client),
 ) -> AsyncIterator[ConversationService]:
     yield ConversationService(session, settings, llm)
+
+
+async def get_note_service(
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+    llm: LLMClient = Depends(get_llm_client),
+) -> AsyncIterator[NoteService]:
+    yield NoteService(session, settings, llm)

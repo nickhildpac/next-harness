@@ -74,6 +74,40 @@ class Settings(BaseSettings):
         ),
     }
 
+    note_styles: dict[str, ToneDefinition] = {
+        "default": ToneDefinition(
+            system_template=(
+                "You produce clean, well-structured markdown notes with headings, lists, and short paragraphs."
+            ),
+            temperature=0.4,
+            top_p=0.9,
+        ),
+        "academic": ToneDefinition(
+            system_template=(
+                "You produce academic markdown notes: precise, formal, and taxonomic. "
+                "Use nested lists for structure."
+            ),
+            temperature=0.25,
+            top_p=0.85,
+        ),
+        "meeting": ToneDefinition(
+            system_template=(
+                "You produce meeting notes as markdown with 'Attendees', 'Agenda', 'Decisions', "
+                "'Action Items' (owner + due), and 'Notes' sections. Bullet-first, terse."
+            ),
+            temperature=0.3,
+            top_p=0.88,
+        ),
+        "blog": ToneDefinition(
+            system_template=(
+                "You produce engaging blog-style markdown: catchy H1, hook paragraph, "
+                "scannable H2 sections, closing takeaway."
+            ),
+            temperature=0.7,
+            top_p=0.95,
+        ),
+    }
+
 
 @lru_cache
 def get_settings() -> Settings:
