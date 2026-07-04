@@ -23,6 +23,19 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload
 ```
 
+The backend can use either OpenRouter or Ollama through the same internal LLM port.
+`LLM_PROVIDER=openrouter` is the default; when `OPENROUTER_API_KEY` is not set, the
+app falls back to local Ollama automatically.
+
+```bash
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openai/gpt-4o-mini
+```
+
+Per request, use `X-LLM-Provider: openrouter` or `X-LLM-Provider: ollama`; the
+same value is also accepted as `?llm_provider=openrouter`.
+
 Ollama is expected at `http://localhost:11434` with `llama3.1` available:
 
 ```bash
@@ -49,4 +62,3 @@ SQLite is the default for local development. Compose overrides `DATABASE_URL` to
 - `GET /health/llm`
 
 Streaming uses Server-Sent Events.
-
