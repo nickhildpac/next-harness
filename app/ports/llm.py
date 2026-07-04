@@ -26,6 +26,10 @@ class LLMResult:
 
 
 class LLMClient(Protocol):
+    def resolve_model(self, params: GenerationParams) -> str:
+        """The model this client will actually use for the given params."""
+        ...
+
     async def chat(self, messages: list[ChatMessage], params: GenerationParams) -> LLMResult:
         ...
 
