@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import conversations, health, notes, providers, tones
+from app.api.routes import conversations, health, notes, providers, tones, translations
 from app.core.config import get_settings
 from app.core.logging import RequestContextMiddleware, configure_logging
 from app.db.session import create_db_and_tables
@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
     app.include_router(providers.router)
     app.include_router(conversations.router)
     app.include_router(notes.router)
+    app.include_router(translations.router)
     app.mount("/app", StaticFiles(directory="app/static", html=True), name="app")
 
     @app.get("/", include_in_schema=False)

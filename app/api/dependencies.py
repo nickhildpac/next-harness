@@ -16,6 +16,7 @@ from app.ports.llm import LLMClient
 from app.services.conversations import ConversationService
 from app.services.notes import NoteService
 from app.services.tokens import TokenCounter
+from app.services.translations import TranslationService
 
 SUPPORTED_PROVIDERS = {"openrouter", "ollama", "auto", "openai", "anthropic", "gemini"}
 
@@ -80,3 +81,11 @@ async def get_note_service(
     llm: LLMClient = Depends(get_llm_client),
 ) -> AsyncIterator[NoteService]:
     yield NoteService(session, settings, llm)
+
+
+async def get_translation_service(
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+    llm: LLMClient = Depends(get_llm_client),
+) -> AsyncIterator[TranslationService]:
+    yield TranslationService(session, settings, llm)

@@ -80,3 +80,17 @@ class Note(Base, IdMixin, TimestampMixin):
     custom_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+
+class Translation(Base, IdMixin, TimestampMixin):
+    __tablename__ = "translations"
+    __table_args__ = (Index("ix_translations_user_updated", "user_id", "updated_at"),)
+
+    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    target_language: Mapped[str] = mapped_column(String(64), nullable=False)
+    translated_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    romanized_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
