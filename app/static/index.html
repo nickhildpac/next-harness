@@ -242,14 +242,33 @@
     <div style="font-family:'Baloo 2', sans-serif; font-weight:700; font-size:20px; color:oklch(0.3 0.03 50);">New conversation</div>
 
     <label style="display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
+      Type
+      <select id="ncKind" style="padding:10px 12px; border:1px solid oklch(0.88 0.015 55); border-radius:10px; font-size:14px; font-family:inherit; color:oklch(0.3 0.03 50); background:white; outline:none; cursor:pointer;">
+        <option value="assistant">Assistant chat</option>
+        <option value="duo">Two people</option>
+      </select>
+    </label>
+
+    <label style="display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
       Title
       <input id="ncTitle" type="text" maxlength="255" placeholder="New conversation" style="padding:10px 12px; border:1px solid oklch(0.88 0.015 55); border-radius:10px; font-size:14px; font-family:inherit; color:oklch(0.3 0.03 50); outline:none;">
     </label>
 
-    <label style="display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
+    <label id="ncUserRow" style="display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
       User ID
       <input id="ncUserId" type="text" maxlength="128" placeholder="anonymous" style="padding:10px 12px; border:1px solid oklch(0.88 0.015 55); border-radius:10px; font-size:14px; font-family:inherit; color:oklch(0.3 0.03 50); outline:none;">
     </label>
+
+    <div id="ncDuoRow" style="display:none; gap:10px;">
+      <label style="flex:1; display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
+        Participant 1
+        <input id="ncUserA" type="text" maxlength="128" placeholder="alice" style="padding:10px 12px; border:1px solid oklch(0.88 0.015 55); border-radius:10px; font-size:14px; font-family:inherit; color:oklch(0.3 0.03 50); outline:none; min-width:0;">
+      </label>
+      <label style="flex:1; display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
+        Participant 2
+        <input id="ncUserB" type="text" maxlength="128" placeholder="bob" style="padding:10px 12px; border:1px solid oklch(0.88 0.015 55); border-radius:10px; font-size:14px; font-family:inherit; color:oklch(0.3 0.03 50); outline:none; min-width:0;">
+      </label>
+    </div>
 
     <label style="display:flex; flex-direction:column; gap:6px; font-size:13px; font-weight:600; color:oklch(0.45 0.03 50);">
       Tone
@@ -299,6 +318,7 @@ let llmAvailable = true;
 let healthChecked = false;
 let streamController = null;
 let lastSendText = "";
+let suggesting = false;
 
 function apiUrl(path) {
   return `${API_BASE_URL.replace(/\/$/, '')}${path}`;
@@ -318,9 +338,14 @@ function toneColor(label) {
 }
 
 function normalizeConversation(c) {
+  const kind = c.kind || 'assistant';
+  const participants = kind === 'duo' ? [c.user_id, c.second_user_id].filter(Boolean) : [];
   return {
     id: c.id,
-    title: c.title || 'New conversation',
+    kind,
+    participants,
+    sendAs: participants[0] || null,
+    title: c.title || (participants.length ? participants.join(' & ') : 'New conversation'),
     tone: toneLabel(c.tone_name || c.tone || 'friendly'),
     messages: c.messages ? c.messages.map(normalizeMessage) : [],
     loaded: !!c.messages,
@@ -331,6 +356,8 @@ function normalizeConversation(c) {
 function normalizeMessage(m) {
   return {
     id: m.id,
+    user_id: m.user_id,
+    model: m.model || null,
     sender: m.role === 'user' ? 'You' : 'Assistant',
     role: m.role,
     text: m.content || m.text || '',
@@ -347,6 +374,10 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s || '';
   return d.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
 }
 
 async function request(path, options = {}) {
@@ -453,7 +484,7 @@ function renderSidebar() {
     const bg = c.id === activeId ? "oklch(0.91 0.03 50)" : "transparent";
     return `<div class="conv-item" data-id="${c.id}" style="padding:11px 12px; border-radius:12px; cursor:pointer; display:flex; flex-direction:column; gap:3px; background:${bg};">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
-        <div style="font-weight:600; font-size:14px; color:oklch(0.3 0.03 50); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(c.title)}</div>
+        <div style="font-weight:600; font-size:14px; color:oklch(0.3 0.03 50); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${c.kind === 'duo' ? '👥 ' : ''}${esc(c.title)}</div>
         <div style="width:7px; height:7px; min-width:7px; border-radius:50%; background:${toneColor(c.tone)};"></div>
       </div>
       <div style="font-size:12.5px; color:oklch(0.55 0.02 55); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${esc(preview)}</div>
@@ -475,6 +506,9 @@ function renderMain() {
   const active = conversations.find(c => c.id === activeId);
   if (!active) { panel.innerHTML = ''; return; }
 
+  const isDuo = active.kind === 'duo';
+  if (isDuo && !active.sendAs) active.sendAs = active.participants[0] || null;
+
   const toneOptionsHtml = TONE_OPTIONS.map(t => `<option value="${t}" ${t === active.tone ? 'selected' : ''}>${t}</option>`).join('');
 
   const statusHtml = !healthChecked ? '' : llmAvailable ? '' : `<div style="padding:9px 26px; background:oklch(0.94 0.04 55); color:oklch(0.42 0.08 45); font-size:12.5px; border-bottom:1px solid oklch(0.9 0.03 55);">connecting...</div>`;
@@ -485,32 +519,53 @@ function renderMain() {
         <div style="padding:13px 16px; border-radius:16px 16px 16px 4px; background:white; color:oklch(0.55 0.02 55); font-size:14.5px; line-height:1.55; box-shadow:0 1px 3px oklch(0.3 0.02 50 / 0.06); white-space:pre-wrap;">Loading conversation...</div>
       </div>
     </div>` : active.messages.map(m => {
-    const justify = m.role === 'user' ? 'flex-end' : 'flex-start';
-    const align = m.role === 'user' ? 'flex-end' : 'flex-start';
-    const radius = m.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px';
-    const bg = m.role === 'user' ? 'oklch(0.7 0.15 45)' : 'white';
-    const color = m.role === 'user' ? 'white' : 'oklch(0.3 0.02 55)';
+    const mine = isDuo ? (!!m.user_id && m.user_id === active.sendAs) : m.role === 'user';
+    const senderLabel = isDuo && m.user_id ? `${m.user_id}${m.model ? ' · ✨ AI draft' : ''}` : m.sender;
+    const justify = mine ? 'flex-end' : 'flex-start';
+    const align = mine ? 'flex-end' : 'flex-start';
+    const radius = mine ? '16px 16px 4px 16px' : '16px 16px 16px 4px';
+    const bg = mine ? 'oklch(0.7 0.15 45)' : 'white';
+    const color = mine ? 'white' : 'oklch(0.3 0.02 55)';
     const cursor = m.streaming ? '<span class="cursor-blink"></span>' : '';
     const retry = m.error ? `<button data-retry="1" style="margin-top:8px; border:none; background:transparent; color:oklch(0.62 0.14 45); font-weight:600; font-size:12.5px; cursor:pointer; padding:0;">Retry</button>` : '';
     return `<div style="display:flex; justify-content:${justify};">
       <div style="max-width:62%; display:flex; flex-direction:column; gap:5px; align-items:${align};">
-        <div style="font-size:11.5px; font-weight:600; color:oklch(0.55 0.02 55); padding:0 4px;">${esc(m.sender)}</div>
+        <div style="font-size:11.5px; font-weight:600; color:oklch(0.55 0.02 55); padding:0 4px;">${esc(senderLabel)}</div>
         <div style="padding:13px 16px; border-radius:${radius}; background:${bg}; color:${color}; font-size:14.5px; line-height:1.55; box-shadow:0 1px 3px oklch(0.3 0.02 50 / 0.06); white-space:pre-wrap;">${esc(m.text)}${cursor}${retry}</div>
       </div>
     </div>`;
   }).join('');
 
-  const sendDisabled = !draft.trim() || streaming || !llmAvailable;
+  const composerLocked = streaming || suggesting || (!isDuo && !llmAvailable);
+  const sendDisabled = !draft.trim() || composerLocked;
   const sendBg = sendDisabled ? 'oklch(0.85 0.02 55)' : 'oklch(0.7 0.15 45)';
-  const hintText = streaming ? 'Assistant is responding...' : !llmAvailable ? 'connecting...' : 'Enter to send · Shift+Enter for new line';
+  const suggestDisabled = streaming || suggesting || !llmAvailable;
+  const hintText = suggesting ? `Drafting a reply for ${esc(active.sendAs || '')}...`
+    : streaming ? 'Assistant is responding...'
+    : (!llmAvailable && !isDuo) ? 'connecting...'
+    : isDuo ? `Enter to send as ${esc(active.sendAs || '')} · ✨ drafts their reply with AI`
+    : 'Enter to send · Shift+Enter for new line';
+
+  const sendAsHtml = isDuo ? `
+        <label style="font-size:12.5px; color:oklch(0.5 0.02 55); font-weight:500;">Acting as</label>
+        <select id="sendAsSelect" style="padding:9px 14px; border-radius:10px; border:1.5px solid oklch(0.88 0.02 55); background:white; font-size:13.5px; font-weight:600; color:oklch(0.32 0.03 50); cursor:pointer; outline:none;">
+          ${active.participants.map(p => `<option value="${escAttr(p)}" ${p === active.sendAs ? 'selected' : ''}>${esc(p)}</option>`).join('')}
+        </select>` : '';
+
+  const suggestBtnHtml = isDuo ? `<button id="suggestBtn" title="Draft a reply for ${escAttr(active.sendAs || '')} with AI" ${suggestDisabled ? 'disabled' : ''} style="width:40px; height:40px; min-width:40px; border-radius:12px; border:1.5px solid oklch(0.88 0.02 55); background:${suggestDisabled ? 'oklch(0.95 0.01 55)' : 'white'}; font-size:16px; cursor:${suggestDisabled ? 'default' : 'pointer'}; display:flex; align-items:center; justify-content:center;">✨</button>` : '';
+
+  const subtitle = isDuo
+    ? `${esc(active.participants.join(' & '))} · ${active.messages.length} messages`
+    : `${active.messages.length} messages`;
 
   panel.innerHTML = `
-    <div style="display:flex; align-items:center; justify-content:space-between; padding:16px 26px; border-bottom:1px solid oklch(0.92 0.015 55); background:oklch(0.985 0.008 65);">
-      <div style="display:flex; flex-direction:column; gap:2px;">
-        <div style="font-family:'Baloo 2', sans-serif; font-weight:600; font-size:18px; color:oklch(0.28 0.03 50);">${esc(active.title)}</div>
-        <div style="font-size:12px; color:oklch(0.55 0.02 55);">${active.messages.length} messages</div>
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; row-gap:10px; padding:16px 26px; border-bottom:1px solid oklch(0.92 0.015 55); background:oklch(0.985 0.008 65);">
+      <div style="display:flex; flex-direction:column; gap:2px; min-width:180px; margin-right:14px;">
+        <div style="font-family:'Baloo 2', sans-serif; font-weight:600; font-size:18px; color:oklch(0.28 0.03 50); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${isDuo ? '👥 ' : ''}${esc(active.title)}</div>
+        <div style="font-size:12px; color:oklch(0.55 0.02 55); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${subtitle}</div>
       </div>
-      <div style="display:flex; align-items:center; gap:10px;">
+      <div style="display:flex; align-items:center; gap:10px; flex-shrink:0;">
+        ${sendAsHtml}
         <label style="font-size:12.5px; color:oklch(0.5 0.02 55); font-weight:500;">Tone</label>
         <select id="toneSelect" style="padding:9px 14px; border-radius:10px; border:1.5px solid oklch(0.88 0.02 55); background:white; font-size:13.5px; font-weight:600; color:oklch(0.32 0.03 50); cursor:pointer; outline:none;">
           ${toneOptionsHtml}
@@ -524,7 +579,8 @@ function renderMain() {
     </div>
     <div style="padding:18px 26px 24px 26px; border-top:1px solid oklch(0.92 0.015 55); background:oklch(0.985 0.008 65);">
       <div style="display:flex; align-items:flex-end; gap:10px; background:white; border:1.5px solid oklch(0.9 0.015 55); border-radius:16px; padding:8px 8px 8px 16px; box-shadow:0 1px 4px oklch(0.3 0.02 50 / 0.05);">
-        <textarea id="draftInput" placeholder="Message the assistant..." rows="1" style="flex:1; border:none; outline:none; resize:none; font-size:14.5px; color:oklch(0.28 0.02 55); background:transparent; padding:8px 0; max-height:140px;">${esc(draft)}</textarea>
+        <textarea id="draftInput" placeholder="${isDuo ? `Message as ${escAttr(active.sendAs || '')}...` : 'Message the assistant...'}" rows="1" style="flex:1; border:none; outline:none; resize:none; font-size:14.5px; color:oklch(0.28 0.02 55); background:transparent; padding:8px 0; max-height:140px;">${esc(draft)}</textarea>
+        ${suggestBtnHtml}
         <button id="sendBtn" class="send-btn" ${sendDisabled ? 'disabled' : ''} style="width:40px; height:40px; min-width:40px; border-radius:12px; border:none; background:${sendBg}; color:white; font-size:17px; cursor:pointer; display:flex; align-items:center; justify-content:center;">↑</button>
       </div>
       <div style="font-size:11px; color:oklch(0.6 0.015 55); margin-top:8px; padding-left:4px;">${hintText}</div>
@@ -537,12 +593,20 @@ function renderMain() {
 
   document.getElementById('toneSelect').addEventListener('change', changeTone);
   document.getElementById('deleteConvBtn').addEventListener('click', () => deleteConversation(active.id));
+  if (isDuo) {
+    document.getElementById('sendAsSelect').addEventListener('change', (e) => {
+      active.sendAs = e.target.value;
+      render();
+    });
+    document.getElementById('suggestBtn').addEventListener('click', suggestReply);
+  }
 
   const draftInput = document.getElementById('draftInput');
   draftInput.addEventListener('input', (e) => {
     draft = e.target.value;
-    document.getElementById('sendBtn').disabled = !draft.trim() || streaming || !llmAvailable;
-    document.getElementById('sendBtn').style.background = (!draft.trim() || streaming || !llmAvailable) ? 'oklch(0.85 0.02 55)' : 'oklch(0.7 0.15 45)';
+    const locked = !draft.trim() || streaming || suggesting || (!isDuo && !llmAvailable);
+    document.getElementById('sendBtn').disabled = locked;
+    document.getElementById('sendBtn').style.background = locked ? 'oklch(0.85 0.02 55)' : 'oklch(0.7 0.15 45)';
   });
   draftInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -594,10 +658,11 @@ async function changeTone(e) {
 
 async function sendMessage(textOverride) {
   const text = (textOverride || draft).trim();
-  if (!text || streaming || !llmAvailable) return;
-
   const active = conversations.find(c => c.id === activeId);
   if (!active) return;
+  const isDuo = active.kind === 'duo';
+  if (!text || streaming || suggesting || (!isDuo && !llmAvailable)) return;
+  if (isDuo) return sendDuoMessage(active, text);
 
   lastSendText = text;
   active.messages = active.messages.filter(m => !m.error);
@@ -683,18 +748,69 @@ function retryLastSend() {
   sendMessage(text);
 }
 
-async function createConversation({ user_id, title, tone_name, custom_persona } = {}) {
+async function sendDuoMessage(active, text) {
+  lastSendText = text;
+  active.messages = active.messages.filter(m => !m.error);
+  const userMsg = { sender: active.sendAs, user_id: active.sendAs, role: 'user', text, pending: true };
+  active.messages.push(userMsg);
+  draft = '';
+  streaming = true;
+  render();
+  try {
+    const response = await request(`/conversations/${encodeURIComponent(active.id)}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id: active.sendAs, content: text })
+    });
+    const data = await response.json();
+    userMsg.id = data.user_message?.id;
+    userMsg.pending = false;
+  } catch (err) {
+    draft = text;
+    active.messages = active.messages.filter(m => m !== userMsg);
+    active.messages.push({ sender: 'Assistant', role: 'assistant', text: `Send failed: ${err.message}`, error: true });
+  } finally {
+    streaming = false;
+    render();
+  }
+}
+
+async function suggestReply() {
+  const active = conversations.find(c => c.id === activeId);
+  if (!active || active.kind !== 'duo' || !active.sendAs || suggesting || streaming || !llmAvailable) return;
+  suggesting = true;
+  render();
+  try {
+    const response = await request(`/conversations/${encodeURIComponent(active.id)}/suggest`, {
+      method: 'POST',
+      body: JSON.stringify({ for_user: active.sendAs, tone_override: { tone: toneId(active.tone) } })
+    });
+    const data = await response.json();
+    draft = data.content || '';
+  } catch (err) {
+    active.messages.push({ sender: 'Assistant', role: 'assistant', text: `Could not draft a reply: ${err.message}`, error: true });
+  } finally {
+    suggesting = false;
+    render();
+  }
+}
+
+async function createConversation({ user_id, title, tone_name, custom_persona, participants } = {}) {
   if (streamController) streamController.abort();
   const tone = { tone_name: tone_name || 'friendly' };
   if (custom_persona) tone.custom_persona = custom_persona;
+  const payload = {
+    title: title || (participants ? participants.join(' & ') : 'New conversation'),
+    tone
+  };
+  if (participants) {
+    payload.participants = participants;
+  } else {
+    payload.user_id = user_id || DEFAULT_USER_ID;
+  }
   try {
     const response = await request('/conversations', {
       method: 'POST',
-      body: JSON.stringify({
-        user_id: user_id || DEFAULT_USER_ID,
-        title: title || 'New conversation',
-        tone
-      })
+      body: JSON.stringify(payload)
     });
     const newConv = normalizeConversation(await response.json());
     newConv.loaded = true;
@@ -719,6 +835,11 @@ function openNewConvModal() {
   document.getElementById('ncTitle').value = '';
   document.getElementById('ncUserId').value = DEFAULT_USER_ID === 'anonymous' ? '' : DEFAULT_USER_ID;
   document.getElementById('ncPersona').value = '';
+  document.getElementById('ncKind').value = 'assistant';
+  document.getElementById('ncUserA').value = '';
+  document.getElementById('ncUserB').value = '';
+  document.getElementById('ncUserRow').style.display = 'flex';
+  document.getElementById('ncDuoRow').style.display = 'none';
   ncTone.value = 'friendly';
   ncPersonaRow.style.display = 'none';
   newConvModal.style.display = 'flex';
@@ -733,13 +854,30 @@ ncTone.addEventListener('change', () => {
   ncPersonaRow.style.display = ncTone.value === 'custom' ? 'flex' : 'none';
 });
 
+document.getElementById('ncKind').addEventListener('change', (e) => {
+  const isDuo = e.target.value === 'duo';
+  document.getElementById('ncUserRow').style.display = isDuo ? 'none' : 'flex';
+  document.getElementById('ncDuoRow').style.display = isDuo ? 'flex' : 'none';
+});
+
 document.getElementById('ncCreate').addEventListener('click', () => {
   const tone_name = ncTone.value;
+  let participants;
+  if (document.getElementById('ncKind').value === 'duo') {
+    const a = document.getElementById('ncUserA').value.trim();
+    const b = document.getElementById('ncUserB').value.trim();
+    if (!a || !b || a === b) {
+      alert('Enter two different participant names.');
+      return;
+    }
+    participants = [a, b];
+  }
   createConversation({
     user_id: document.getElementById('ncUserId').value.trim() || undefined,
     title: document.getElementById('ncTitle').value.trim() || undefined,
     tone_name,
-    custom_persona: tone_name === 'custom' ? document.getElementById('ncPersona').value.trim() || undefined : undefined
+    custom_persona: tone_name === 'custom' ? document.getElementById('ncPersona').value.trim() || undefined : undefined,
+    participants
   });
   closeNewConvModal();
 });

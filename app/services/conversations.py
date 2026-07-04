@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.db.models import Conversation, Message, MessageRole
+from app.db.models import Conversation, ConversationKind, Message, MessageRole
 from app.orchestration.chat_graph import ChatGraph
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, LLMResult
 from app.repositories.conversations import ConversationRepository
@@ -20,6 +20,8 @@ from app.schemas.conversation import (
     MessageCreate,
     MessageResponse,
     PaginatedMessages,
+    SuggestRequest,
+    SuggestResponse,
 )
 from app.services.memory import MemoryService
 from app.services.tokens import TokenCounter
@@ -49,11 +51,19 @@ class ConversationService:
         self.graph = ChatGraph(llm)
 
     async def create(self, payload: ConversationCreate) -> ConversationResponse:
+        if payload.participants:
+            user_id, second_user_id = payload.participants
+            kind = ConversationKind.duo.value
+        else:
+            user_id, second_user_id = payload.user_id, None
+            kind = ConversationKind.assistant.value
         conversation = await self.repo.create(
-            user_id=payload.user_id,
+            user_id=user_id,
             title=payload.title,
             tone_name=payload.tone.tone_name,
             custom_persona=payload.tone.custom_persona,
+            second_user_id=second_user_id,
+            kind=kind,
         )
         await self.session.commit()
         return ConversationResponse.model_validate(conversation)
@@ -97,6 +107,8 @@ class ConversationService:
 
     async def send_message(self, conversation_id: str, payload: MessageCreate) -> ChatResponse:
         conversation = await self._conversation_or_404(conversation_id)
+        if conversation.kind == ConversationKind.duo:
+            return await self._send_duo_message(conversation, payload)
         user_id = self._message_user_id(conversation, payload)
         tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
         # Build context before persisting the new message so it appears exactly once,
@@ -142,6 +154,12 @@ class ConversationService:
     ) -> AsyncIterator[str]:
         try:
             conversation = await self._conversation_or_404(conversation_id)
+            if conversation.kind == ConversationKind.duo:
+                response = await self._send_duo_message(conversation, payload)
+                yield self._sse("message", {"role": "user", "id": response.user_message.id})
+                yield self._sse("done", {"user_message_id": response.user_message.id})
+                yield "data: [DONE]\n\n"
+                return
             user_id = self._message_user_id(conversation, payload)
             tone = self.tones.resolve(
                 payload.tone_override, conversation.tone_name, conversation.custom_persona
@@ -216,6 +234,99 @@ class ConversationService:
                 detail="Local LLM is unavailable or timed out.",
             ) from exc
 
+    async def suggest_reply(self, conversation_id: str, payload: SuggestRequest) -> SuggestResponse:
+        conversation = await self._conversation_or_404(conversation_id)
+        if conversation.kind != ConversationKind.duo:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reply suggestions are only available for two-user conversations.",
+            )
+        participants = self._participants(conversation)
+        if payload.for_user not in participants:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="for_user must be one of the conversation participants.",
+            )
+        tone = self.tones.resolve(
+            payload.tone_override, conversation.tone_name, conversation.custom_persona
+        )
+        other_user = next(p for p in participants if p != payload.for_user)
+        system_prompt = (
+            f"{tone.system_template}\n\n"
+            f"You are drafting the next chat message on behalf of '{payload.for_user}' in a "
+            f"conversation between '{participants[0]}' and '{participants[1]}'. "
+            f"Reply to '{other_user}' in the first person as '{payload.for_user}', staying "
+            "consistent with what they have said so far. "
+            "Write only the message text, with no name prefix or commentary."
+        )
+        context = await self.memory.duo_context_messages(
+            conversation, system_prompt, speak_as=payload.for_user
+        )
+        self._guard_context(context)
+        result = await self._generate(context, tone.temperature, tone.top_p)
+        message_response = None
+        if payload.persist:
+            message = await self.repo.add_message(
+                conversation_id=conversation.id,
+                user_id=payload.for_user,
+                role=MessageRole.user,
+                content=result.content,
+                token_count=result.output_tokens,
+                model=result.model,
+            )
+            await self.memory.summarize_if_needed(conversation)
+            await self.session.commit()
+            message_response = self._message_response(message)
+        logger.info(
+            "suggestion_completed",
+            extra={
+                "conversation_id": conversation.id,
+                "for_user": payload.for_user,
+                "persisted": payload.persist,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            },
+        )
+        return SuggestResponse(
+            conversation_id=conversation.id,
+            for_user=payload.for_user,
+            content=result.content,
+            model=result.model,
+            message=message_response,
+            token_usage={"input": result.input_tokens, "output": result.output_tokens},
+        )
+
+    async def _send_duo_message(
+        self, conversation: Conversation, payload: MessageCreate
+    ) -> ChatResponse:
+        user_id = self._message_user_id(conversation, payload)
+        if user_id not in self._participants(conversation):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="user_id must be one of the conversation participants.",
+            )
+        message = await self.repo.add_message(
+            conversation_id=conversation.id,
+            user_id=user_id,
+            role=MessageRole.user,
+            content=payload.content,
+            token_count=self.token_counter.count(payload.content),
+        )
+        await self.memory.summarize_if_needed(conversation)
+        await self.session.commit()
+        return ChatResponse(
+            conversation_id=conversation.id,
+            user_message=self._message_response(message),
+            assistant_message=None,
+            token_usage={"input": message.token_count, "output": 0},
+        )
+
+    def _participants(self, conversation: Conversation) -> list[str]:
+        participants = [conversation.user_id]
+        if conversation.second_user_id:
+            participants.append(conversation.second_user_id)
+        return participants
+
     async def _persist_assistant(
         self, conversation_id: str, user_id: str, content: str, model: str, *, commit: bool = True
     ) -> Message:
@@ -254,6 +365,7 @@ class ConversationService:
         return MessageResponse(
             id=message.id,
             conversation_id=message.conversation_id,
+            user_id=message.user_id,
             role=message.role.value if hasattr(message.role, "value") else message.role,
             content=message.content,
             token_count=message.token_count,

@@ -70,6 +70,18 @@ the OpenRouter model is set inside its adapter. Ollama is expected at `localhost
 - Models: `Conversation` 1:N `Message`, 1:1 `ConversationSummary`. `IdMixin`/`TimestampMixin` in
   `app/db/base.py`.
 
+### Conversation kinds
+
+`Conversation.kind` is `assistant` (default; one user + LLM replies) or `duo` (two human
+participants: `user_id` + `second_user_id`, created by passing `participants: [a, b]` to
+`POST /conversations`). In duo conversations `POST .../messages` only persists the message
+(`assistant_message` is null; the sender must be a participant) — the LLM only speaks through
+`POST /conversations/{id}/suggest` (`for_user`, aliases `as_user`/`user_id`; optional
+`tone_override` and `persist`). Suggestion context maps the target user's past messages to the
+assistant role and the other participant's to the user role
+(`MemoryService.duo_context_messages`); persisted suggestions are `role=user` rows with `model`
+set, marking them AI-drafted.
+
 ### Tones & request compatibility
 
 - Six built-in tones (each a system template + temperature/top_p) live in `Settings.tones`
@@ -90,5 +102,6 @@ knobs: `context_token_budget` (6000), `summary_trigger_tokens` (4500), `window_t
 ## API surface
 
 `POST /conversations`, `GET /conversations/{id}`, `PATCH /conversations/{id}/tone`,
-`POST /conversations/{id}/messages?stream=true` (SSE), `GET /conversations/{id}/messages`,
+`POST /conversations/{id}/messages?stream=true` (SSE), `POST /conversations/{id}/suggest`
+(duo only: LLM drafts a reply for a participant), `GET /conversations/{id}/messages`,
 `DELETE /conversations/{id}` (archive), `GET /tones`, `GET /health`, `GET /health/llm`.

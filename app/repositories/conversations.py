@@ -2,7 +2,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Conversation, ConversationSummary, Message, MessageRole
+from app.db.models import Conversation, ConversationKind, ConversationSummary, Message, MessageRole
 
 
 class ConversationRepository:
@@ -16,9 +16,16 @@ class ConversationRepository:
         title: str | None,
         tone_name: str,
         custom_persona: str | None,
+        second_user_id: str | None = None,
+        kind: str = ConversationKind.assistant.value,
     ) -> Conversation:
         conversation = Conversation(
-            user_id=user_id, title=title, tone_name=tone_name, custom_persona=custom_persona
+            user_id=user_id,
+            title=title,
+            tone_name=tone_name,
+            custom_persona=custom_persona,
+            second_user_id=second_user_id,
+            kind=kind,
         )
         self.session.add(conversation)
         await self.session.flush()

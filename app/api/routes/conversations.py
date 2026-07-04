@@ -10,6 +10,8 @@ from app.schemas.conversation import (
     ConversationToneUpdate,
     MessageCreate,
     PaginatedMessages,
+    SuggestRequest,
+    SuggestResponse,
 )
 from app.services.conversations import ConversationService
 
@@ -61,6 +63,15 @@ async def send_message(
             media_type="text/event-stream",
         )
     return await service.send_message(conversation_id, payload)
+
+
+@router.post("/{conversation_id}/suggest", response_model=SuggestResponse)
+async def suggest_reply(
+    conversation_id: str,
+    payload: SuggestRequest,
+    service: ConversationService = Depends(get_conversation_service),
+) -> SuggestResponse:
+    return await service.suggest_reply(conversation_id, payload)
 
 
 @router.get("/{conversation_id}/messages", response_model=PaginatedMessages)
