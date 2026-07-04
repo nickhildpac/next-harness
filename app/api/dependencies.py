@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 
+import httpx
 from fastapi import Depends, Request
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,17 +19,22 @@ def get_llm_client(
     settings: Settings = Depends(get_settings),
 ) -> LLMClient:
     provider = _requested_provider(request) or settings.llm_provider
-    return build_llm_client(settings, provider)
+    http_client = getattr(request.app.state, "http_client", None)
+    return build_llm_client(settings, provider, http_client=http_client)
 
 
-def build_llm_client(settings: Settings, provider: str | None = None) -> LLMClient:
+def build_llm_client(
+    settings: Settings,
+    provider: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> LLMClient:
     token_counter = TokenCounter()
     requested = (provider or settings.llm_provider).lower()
     if requested == "ollama":
-        return OllamaClient(settings, token_counter)
+        return OllamaClient(settings, token_counter, http_client)
     if requested in {"openrouter", "auto"} and _has_openrouter_key(settings):
-        return OpenRouterClient(settings, token_counter)
-    return OllamaClient(settings, token_counter)
+        return OpenRouterClient(settings, token_counter, http_client)
+    return OllamaClient(settings, token_counter, http_client)
 
 
 def _requested_provider(request: Request) -> str | None:

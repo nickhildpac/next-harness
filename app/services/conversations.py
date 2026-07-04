@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -6,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.db.models import Conversation, MessageRole
+from app.db.models import Conversation, Message, MessageRole
 from app.orchestration.chat_graph import ChatGraph
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, LLMResult
 from app.repositories.conversations import ConversationRepository
@@ -62,7 +63,7 @@ class ConversationService:
         return [ConversationResponse.model_validate(conversation) for conversation in conversations]
 
     async def get(self, conversation_id: str) -> ConversationDetail:
-        conversation = await self._conversation_or_404(conversation_id)
+        conversation = await self._conversation_or_404(conversation_id, with_messages=True)
         return ConversationDetail(
             **ConversationResponse.model_validate(conversation).model_dump(),
             messages=[self._message_response(message) for message in conversation.messages],
@@ -97,6 +98,12 @@ class ConversationService:
     async def send_message(self, conversation_id: str, payload: MessageCreate) -> ChatResponse:
         conversation = await self._conversation_or_404(conversation_id)
         user_id = self._message_user_id(conversation, payload)
+        tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
+        # Build context before persisting the new message so it appears exactly once,
+        # and so a context-budget rejection leaves nothing behind in the DB.
+        context = await self.memory.context_messages(conversation, tone.system_template)
+        context.append(ChatMessage(role="user", content=payload.content))
+        self._guard_context(context)
         user_message = await self.repo.add_message(
             conversation_id=conversation.id,
             user_id=user_id,
@@ -104,10 +111,6 @@ class ConversationService:
             content=payload.content,
             token_count=self.token_counter.count(payload.content),
         )
-        tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
-        context = await self.memory.context_messages(conversation, tone.system_template)
-        context.append(ChatMessage(role="user", content=payload.content))
-        self._guard_context(context)
         result = await self._generate(context, tone.temperature, tone.top_p)
         assistant_message = await self.repo.add_message(
             conversation_id=conversation.id,
@@ -140,6 +143,12 @@ class ConversationService:
         try:
             conversation = await self._conversation_or_404(conversation_id)
             user_id = self._message_user_id(conversation, payload)
+            tone = self.tones.resolve(
+                payload.tone_override, conversation.tone_name, conversation.custom_persona
+            )
+            context = await self.memory.context_messages(conversation, tone.system_template)
+            context.append(ChatMessage(role="user", content=payload.content))
+            self._guard_context(context)
             user_message = await self.repo.add_message(
                 conversation_id=conversation.id,
                 user_id=user_id,
@@ -147,31 +156,29 @@ class ConversationService:
                 content=payload.content,
                 token_count=self.token_counter.count(payload.content),
             )
-            tone = self.tones.resolve(
-                payload.tone_override, conversation.tone_name, conversation.custom_persona
-            )
-            context = await self.memory.context_messages(conversation, tone.system_template)
-            context.append(ChatMessage(role="user", content=payload.content))
-            self._guard_context(context)
+            # Commit before streaming so the user message survives a client disconnect.
+            await self.session.commit()
             params = GenerationParams(
                 model=self.settings.default_model,
                 temperature=tone.temperature,
                 top_p=tone.top_p,
                 timeout_seconds=self.settings.request_timeout_seconds,
             )
+            model = self.llm.resolve_model(params)
             chunks: list[str] = []
             yield self._sse("message", {"role": "user", "id": user_message.id})
-            async for chunk in self.llm.stream_chat(context, params):
-                chunks.append(chunk)
-                yield self._sse("delta", {"delta": chunk})
+            try:
+                async for chunk in self.llm.stream_chat(context, params):
+                    chunks.append(chunk)
+                    yield self._sse("delta", {"delta": chunk})
+            except (GeneratorExit, asyncio.CancelledError):
+                # Client disconnected mid-stream; keep whatever partial reply arrived.
+                if chunks:
+                    await self._persist_assistant(conversation.id, user_id, "".join(chunks), model)
+                raise
             content = "".join(chunks)
-            assistant_message = await self.repo.add_message(
-                conversation_id=conversation.id,
-                user_id=user_id,
-                role=MessageRole.assistant,
-                content=content,
-                token_count=self.token_counter.count(content),
-                model=self.settings.default_model,
+            assistant_message = await self._persist_assistant(
+                conversation.id, user_id, content, model, commit=False
             )
             await self.memory.summarize_if_needed(conversation)
             await self.session.commit()
@@ -209,6 +216,21 @@ class ConversationService:
                 detail="Local LLM is unavailable or timed out.",
             ) from exc
 
+    async def _persist_assistant(
+        self, conversation_id: str, user_id: str, content: str, model: str, *, commit: bool = True
+    ) -> Message:
+        message = await self.repo.add_message(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=MessageRole.assistant,
+            content=content,
+            token_count=self.token_counter.count(content),
+            model=model,
+        )
+        if commit:
+            await self.session.commit()
+        return message
+
     def _guard_context(self, messages: list[ChatMessage]) -> None:
         tokens = self.token_counter.count_messages(messages)
         if tokens > self.settings.context_token_budget:
@@ -218,9 +240,12 @@ class ConversationService:
             )
 
     async def _conversation_or_404(
-        self, conversation_id: str, user_id: str | None = None
+        self, conversation_id: str, *, with_messages: bool = False
     ) -> Conversation:
-        conversation = await self.repo.get(conversation_id, user_id)
+        if with_messages:
+            conversation = await self.repo.get_with_messages(conversation_id)
+        else:
+            conversation = await self.repo.get(conversation_id)
         if not conversation:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
         return conversation

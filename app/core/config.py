@@ -1,11 +1,11 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field
+from pydantic import AnyHttpUrl, BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class ToneDefinition(BaseSettings):
+class ToneDefinition(BaseModel):
     system_template: str
     temperature: float = Field(ge=0.0, le=2.0)
     top_p: float = Field(ge=0.0, le=1.0)

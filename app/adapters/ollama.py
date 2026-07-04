@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -14,15 +15,32 @@ class OllamaUnavailable(RuntimeError):
 
 
 class OllamaClient(LLMClient):
-    def __init__(self, settings: Settings, token_counter: TokenCounter):
+    def __init__(
+        self,
+        settings: Settings,
+        token_counter: TokenCounter,
+        http_client: httpx.AsyncClient | None = None,
+    ):
         self.settings = settings
         self.token_counter = token_counter
         self.base_url = str(settings.ollama_base_url).rstrip("/")
+        self._http = http_client
+
+    def resolve_model(self, params: GenerationParams) -> str:
+        return params.model
+
+    @asynccontextmanager
+    async def _client(self) -> AsyncIterator[httpx.AsyncClient]:
+        if self._http is not None:
+            yield self._http
+        else:
+            async with httpx.AsyncClient() as client:
+                yield client
 
     async def health(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                response = await client.get(f"{self.base_url}/api/tags")
+            async with self._client() as client:
+                response = await client.get(f"{self.base_url}/api/tags", timeout=5)
                 return response.status_code == 200
         except httpx.HTTPError:
             return False
@@ -34,14 +52,12 @@ class OllamaClient(LLMClient):
         reraise=True,
     )
     async def chat(self, messages: list[ChatMessage], params: GenerationParams) -> LLMResult:
-        payload = {
-            "model": params.model,
-            "messages": [message.__dict__ for message in messages],
-            "stream": False,
-            "options": {"temperature": params.temperature, "top_p": params.top_p},
-        }
-        async with httpx.AsyncClient(timeout=params.timeout_seconds) as client:
-            response = await client.post(f"{self.base_url}/api/chat", json=payload)
+        async with self._client() as client:
+            response = await client.post(
+                f"{self.base_url}/api/chat",
+                json=self._payload(messages, params, stream=False),
+                timeout=params.timeout_seconds,
+            )
         if response.status_code >= 500:
             raise OllamaUnavailable("Ollama returned an unavailable status")
         response.raise_for_status()
@@ -57,14 +73,13 @@ class OllamaClient(LLMClient):
     async def stream_chat(
         self, messages: list[ChatMessage], params: GenerationParams
     ) -> AsyncIterator[str]:
-        payload = {
-            "model": params.model,
-            "messages": [message.__dict__ for message in messages],
-            "stream": True,
-            "options": {"temperature": params.temperature, "top_p": params.top_p},
-        }
-        async with httpx.AsyncClient(timeout=params.timeout_seconds) as client:
-            async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
+        async with self._client() as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/api/chat",
+                json=self._payload(messages, params, stream=True),
+                timeout=params.timeout_seconds,
+            ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line:
@@ -74,3 +89,12 @@ class OllamaClient(LLMClient):
                     if chunk:
                         yield chunk
 
+    def _payload(
+        self, messages: list[ChatMessage], params: GenerationParams, *, stream: bool
+    ) -> dict:
+        return {
+            "model": params.model,
+            "messages": [message.__dict__ for message in messages],
+            "stream": stream,
+            "options": {"temperature": params.temperature, "top_p": params.top_p},
+        }
