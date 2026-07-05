@@ -15,6 +15,7 @@ from app.schemas.conversation import (
     ChatResponse,
     ConversationCreate,
     ConversationDetail,
+    ConversationRagUpdate,
     ConversationResponse,
     ConversationToneUpdate,
     MessageCreate,
@@ -23,7 +24,9 @@ from app.schemas.conversation import (
     SuggestRequest,
     SuggestResponse,
 )
+from app.schemas.document import Citation
 from app.services.memory import MemoryService
+from app.services.rag import CitedChunk, RagService
 from app.services.tokens import TokenCounter
 from app.services.tones import ToneService
 
@@ -31,10 +34,17 @@ logger = logging.getLogger(__name__)
 
 
 class ConversationService:
-    def __init__(self, session: AsyncSession, settings: Settings, llm: LLMClient):
+    def __init__(
+        self,
+        session: AsyncSession,
+        settings: Settings,
+        llm: LLMClient,
+        rag: RagService | None = None,
+    ):
         self.session = session
         self.settings = settings
         self.llm = llm
+        self.rag = rag
         self.repo = ConversationRepository(session)
         self.token_counter = TokenCounter()
         self.tones = ToneService(settings)
@@ -64,6 +74,7 @@ class ConversationService:
             custom_persona=payload.tone.custom_persona,
             second_user_id=second_user_id,
             kind=kind,
+            use_documents=payload.use_documents,
         )
         await self.session.commit()
         return ConversationResponse.model_validate(conversation)
@@ -86,6 +97,16 @@ class ConversationService:
         conversation = await self._conversation_or_404(conversation_id)
         updated = await self.repo.update_tone(
             conversation, tone_name=payload.tone_name, custom_persona=payload.custom_persona
+        )
+        await self.session.commit()
+        return ConversationResponse.model_validate(updated)
+
+    async def update_rag(
+        self, conversation_id: str, payload: ConversationRagUpdate
+    ) -> ConversationResponse:
+        conversation = await self._conversation_or_404(conversation_id)
+        updated = await self.repo.update_use_documents(
+            conversation, use_documents=payload.use_documents
         )
         await self.session.commit()
         return ConversationResponse.model_validate(updated)
@@ -123,6 +144,8 @@ class ConversationService:
         context = await self.memory.context_messages(conversation, tone.system_template)
         context.append(ChatMessage(role="user", content=payload.content))
         self._guard_context(context)
+        rag_chunks = await self._retrieve_documents(conversation, payload.content, context)
+        citations = self.rag.build_citations(rag_chunks) if rag_chunks else []
         user_message = await self.repo.add_message(
             conversation_id=conversation.id,
             user_id=user_id,
@@ -138,6 +161,7 @@ class ConversationService:
             content=result.content,
             token_count=result.output_tokens,
             model=result.model,
+            citations=[citation.model_dump() for citation in citations] or None,
         )
         await self.memory.summarize_if_needed(conversation)
         await self.session.commit()
@@ -154,6 +178,7 @@ class ConversationService:
             user_message=self._message_response(user_message),
             assistant_message=self._message_response(assistant_message),
             token_usage={"input": result.input_tokens, "output": result.output_tokens},
+            citations=citations,
         )
 
     async def stream_message(
@@ -174,6 +199,9 @@ class ConversationService:
             context = await self.memory.context_messages(conversation, tone.system_template)
             context.append(ChatMessage(role="user", content=payload.content))
             self._guard_context(context)
+            rag_chunks = await self._retrieve_documents(conversation, payload.content, context)
+            citations = self.rag.build_citations(rag_chunks) if rag_chunks else []
+            citation_payload = [citation.model_dump() for citation in citations] or None
             user_message = await self.repo.add_message(
                 conversation_id=conversation.id,
                 user_id=user_id,
@@ -192,6 +220,10 @@ class ConversationService:
             model = self.llm.resolve_model(params)
             chunks: list[str] = []
             yield self._sse("message", {"role": "user", "id": user_message.id})
+            if citations:
+                yield self._sse(
+                    "citations", {"citations": [citation.model_dump() for citation in citations]}
+                )
             try:
                 async for chunk in self.llm.stream_chat(context, params):
                     chunks.append(chunk)
@@ -199,11 +231,13 @@ class ConversationService:
             except (GeneratorExit, asyncio.CancelledError):
                 # Client disconnected mid-stream; keep whatever partial reply arrived.
                 if chunks:
-                    await self._persist_assistant(conversation.id, user_id, "".join(chunks), model)
+                    await self._persist_assistant(
+                        conversation.id, user_id, "".join(chunks), model, citations=citation_payload
+                    )
                 raise
             content = "".join(chunks)
             assistant_message = await self._persist_assistant(
-                conversation.id, user_id, content, model, commit=False
+                conversation.id, user_id, content, model, commit=False, citations=citation_payload
             )
             await self.memory.summarize_if_needed(conversation)
             await self.session.commit()
@@ -335,7 +369,14 @@ class ConversationService:
         return participants
 
     async def _persist_assistant(
-        self, conversation_id: str, user_id: str, content: str, model: str, *, commit: bool = True
+        self,
+        conversation_id: str,
+        user_id: str,
+        content: str,
+        model: str,
+        *,
+        commit: bool = True,
+        citations: list | None = None,
     ) -> Message:
         message = await self.repo.add_message(
             conversation_id=conversation_id,
@@ -344,10 +385,30 @@ class ConversationService:
             content=content,
             token_count=self.token_counter.count(content),
             model=model,
+            citations=citations,
         )
         if commit:
             await self.session.commit()
         return message
+
+    async def _retrieve_documents(
+        self, conversation: Conversation, query: str, context: list[ChatMessage]
+    ) -> list[CitedChunk]:
+        """Inject retrieved chunks into `context` when the conversation opts in.
+
+        Runs after `_guard_context`, so history keeps the full budget and chunks only get the
+        remainder (capped by rag_token_budget) — retrieved chunks are trimmed before history.
+        """
+        if not conversation.use_documents or self.rag is None:
+            return []
+        remaining = self.settings.context_token_budget - self.token_counter.count_messages(context)
+        chunks = await self.rag.retrieve(
+            conversation.id, query, min(self.settings.rag_token_budget, remaining)
+        )
+        if chunks:
+            # After the tone prompt, before summary/history; never re-trimmed.
+            context.insert(1, ChatMessage(role="system", content=self.rag.format_context(chunks)))
+        return chunks
 
     def _guard_context(self, messages: list[ChatMessage]) -> None:
         tokens = self.token_counter.count_messages(messages)
@@ -378,6 +439,9 @@ class ConversationService:
             token_count=message.token_count,
             model=message.model,
             created_at=message.created_at,
+            citations=[Citation(**citation) for citation in message.citations]
+            if message.citations
+            else None,
         )
 
     def _message_user_id(self, conversation: Conversation, payload: MessageCreate) -> str:

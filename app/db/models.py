@@ -30,6 +30,7 @@ class Conversation(Base, IdMixin, TimestampMixin):
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tone_name: Mapped[str] = mapped_column(String(64), default="professional", nullable=False)
     custom_persona: Mapped[str | None] = mapped_column(Text, nullable=True)
+    use_documents: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     messages: Mapped[list["Message"]] = relationship(
@@ -37,6 +38,9 @@ class Conversation(Base, IdMixin, TimestampMixin):
     )
     summary: Mapped["ConversationSummary | None"] = relationship(
         back_populates="conversation", cascade="all, delete-orphan", uselist=False
+    )
+    documents: Mapped[list["Document"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
     )
 
 
@@ -52,6 +56,7 @@ class Message(Base, IdMixin, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    citations: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
@@ -67,6 +72,42 @@ class ConversationSummary(Base, IdMixin, TimestampMixin):
     token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     conversation: Mapped[Conversation] = relationship(back_populates="summary")
+
+
+class Document(Base, IdMixin, TimestampMixin):
+    __tablename__ = "documents"
+
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    conversation: Mapped[Conversation] = relationship(back_populates="documents")
+    chunks: Mapped[list["DocumentChunk"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="DocumentChunk.chunk_index",
+    )
+
+
+class DocumentChunk(Base, IdMixin, TimestampMixin):
+    __tablename__ = "document_chunks"
+    __table_args__ = (Index("ix_document_chunks_doc_index", "document_id", "chunk_index"),)
+
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # Denormalized so retrieval can join hits to rows without going through documents.
+    conversation_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 1-based; None for txt/md
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    document: Mapped[Document] = relationship(back_populates="chunks")
 
 
 class Note(Base, IdMixin, TimestampMixin):

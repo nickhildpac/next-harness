@@ -18,6 +18,7 @@ class ConversationRepository:
         custom_persona: str | None,
         second_user_id: str | None = None,
         kind: str = ConversationKind.assistant.value,
+        use_documents: bool = False,
     ) -> Conversation:
         conversation = Conversation(
             user_id=user_id,
@@ -26,6 +27,7 @@ class ConversationRepository:
             custom_persona=custom_persona,
             second_user_id=second_user_id,
             kind=kind,
+            use_documents=use_documents,
         )
         self.session.add(conversation)
         await self.session.flush()
@@ -67,6 +69,13 @@ class ConversationRepository:
         await self.session.flush()
         return conversation
 
+    async def update_use_documents(
+        self, conversation: Conversation, *, use_documents: bool
+    ) -> Conversation:
+        conversation.use_documents = use_documents
+        await self.session.flush()
+        return conversation
+
     async def add_message(
         self,
         *,
@@ -76,6 +85,7 @@ class ConversationRepository:
         content: str,
         token_count: int,
         model: str | None = None,
+        citations: list | None = None,
     ) -> Message:
         message = Message(
             conversation_id=conversation_id,
@@ -84,6 +94,7 @@ class ConversationRepository:
             content=content,
             token_count=token_count,
             model=model,
+            citations=citations,
         )
         self.session.add(message)
         await self.session.flush()

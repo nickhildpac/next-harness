@@ -6,6 +6,7 @@ from app.schemas.conversation import (
     ChatResponse,
     ConversationCreate,
     ConversationDetail,
+    ConversationRagUpdate,
     ConversationResponse,
     ConversationToneUpdate,
     MessageCreate,
@@ -48,6 +49,15 @@ async def update_tone(
     service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationResponse:
     return await service.update_tone(conversation_id, payload)
+
+
+@router.patch("/{conversation_id}/rag", response_model=ConversationResponse)
+async def update_rag(
+    conversation_id: str,
+    payload: ConversationRagUpdate,
+    service: ConversationService = Depends(get_conversation_service),
+) -> ConversationResponse:
+    return await service.update_rag(conversation_id, payload)
 
 
 @router.post("/{conversation_id}/messages", response_model=ChatResponse)

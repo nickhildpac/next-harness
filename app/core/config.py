@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AnyHttpUrl, BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,23 @@ class Settings(BaseSettings):
     summary_trigger_tokens: int = 4500
     window_turn_count: int = 12
     custom_persona_max_chars: int = 800
+
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int | None = None
+    chroma_persist_dir: str = "./var/chroma"
+    rag_chunk_size: int = 1200  # characters (~300 tokens at the chars/4 approximation)
+    rag_chunk_overlap: int = 150
+    rag_top_k: int = 5
+    rag_token_budget: int = 1500  # cap on the retrieved-chunk share of the context budget
+    rag_max_upload_bytes: int = 10 * 1024 * 1024
+
+    @field_validator("embedding_dimensions", mode="before")
+    @classmethod
+    def empty_dimensions_as_none(cls, value):
+        # Allow a blank EMBEDDING_DIMENSIONS= line in .env, matching the optional key style.
+        if value == "":
+            return None
+        return value
 
     tones: dict[str, ToneDefinition] = {
         "professional": ToneDefinition(

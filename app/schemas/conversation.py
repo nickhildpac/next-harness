@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.document import Citation
+
 
 ToneName = Literal["professional", "friendly", "concise", "empathetic", "technical", "humorous", "custom"]
 
@@ -58,6 +60,7 @@ class ConversationCreate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
     tone: ToneConfig = Field(default_factory=ToneConfig)
     participants: list[str] | None = Field(default=None)
+    use_documents: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -83,6 +86,10 @@ class ConversationToneUpdate(ToneConfig):
     pass
 
 
+class ConversationRagUpdate(BaseModel):
+    use_documents: bool
+
+
 class ConversationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -93,6 +100,7 @@ class ConversationResponse(BaseModel):
     title: str | None
     tone_name: str
     custom_persona: str | None
+    use_documents: bool = False
     is_archived: bool
     created_at: datetime
     updated_at: datetime
@@ -120,6 +128,7 @@ class MessageResponse(BaseModel):
     token_count: int
     model: str | None
     created_at: datetime
+    citations: list[Citation] | None = None
 
 
 class ConversationDetail(ConversationResponse):
@@ -133,6 +142,7 @@ class ChatResponse(BaseModel):
     # None for two-user conversations, where the LLM only replies via /suggest.
     assistant_message: MessageResponse | None = None
     token_usage: dict[str, int]
+    citations: list[Citation] = []
 
 
 class SuggestRequest(BaseModel):

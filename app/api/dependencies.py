@@ -6,15 +6,20 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.anthropic import AnthropicClient
+from app.adapters.chroma import ChromaVectorStore
 from app.adapters.gemini import GeminiClient
 from app.adapters.ollama import OllamaClient
 from app.adapters.openai import OpenAIClient
+from app.adapters.openai_embeddings import OpenAIEmbeddingsClient
 from app.adapters.openrouter import OpenRouterClient
 from app.core.config import Settings, get_settings
 from app.db.session import get_session
+from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import LLMClient
+from app.ports.vectorstore import VectorStore
 from app.services.conversations import ConversationService
 from app.services.notes import NoteService
+from app.services.rag import RagService
 from app.services.tasks import TaskService
 from app.services.tokens import TokenCounter
 from app.services.translations import TranslationService
@@ -86,12 +91,46 @@ def _has_key(value: str | SecretStr | None) -> bool:
     return bool(value)
 
 
+def get_embeddings_client(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> EmbeddingsClient:
+    # Lenient on purpose: the API key is only checked when an embed call actually happens,
+    # so conversations with use_documents off never fail on a missing key.
+    http_client = getattr(request.app.state, "http_client", None)
+    return OpenAIEmbeddingsClient(settings, http_client)
+
+
+def get_vector_store(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> VectorStore:
+    # One embedded Chroma client per process, cached like http_client.
+    store = getattr(request.app.state, "vector_store", None)
+    if store is None:
+        store = ChromaVectorStore(settings)
+        request.app.state.vector_store = store
+    return store
+
+
+async def get_rag_service(
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+    embeddings: EmbeddingsClient = Depends(get_embeddings_client),
+    vectorstore: VectorStore = Depends(get_vector_store),
+) -> AsyncIterator[RagService]:
+    yield RagService(session, settings, embeddings, vectorstore)
+
+
 async def get_conversation_service(
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
     llm: LLMClient = Depends(get_llm_client),
+    embeddings: EmbeddingsClient = Depends(get_embeddings_client),
+    vectorstore: VectorStore = Depends(get_vector_store),
 ) -> AsyncIterator[ConversationService]:
-    yield ConversationService(session, settings, llm)
+    rag = RagService(session, settings, embeddings, vectorstore)
+    yield ConversationService(session, settings, llm, rag=rag)
 
 
 async def get_note_service(

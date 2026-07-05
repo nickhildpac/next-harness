@@ -14,6 +14,9 @@ def test_openapi_contains_conversation_routes():
 
     assert "/conversations" in paths
     assert "/conversations/{conversation_id}/messages" in paths
+    assert "/conversations/{conversation_id}/rag" in paths
+    assert "/conversations/{conversation_id}/documents" in paths
+    assert "/conversations/{conversation_id}/documents/{document_id}" in paths
     assert "/tones" in paths
     assert "/providers" in paths
 
