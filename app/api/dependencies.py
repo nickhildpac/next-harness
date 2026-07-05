@@ -15,6 +15,7 @@ from app.db.session import get_session
 from app.ports.llm import LLMClient
 from app.services.conversations import ConversationService
 from app.services.notes import NoteService
+from app.services.tasks import TaskService
 from app.services.tokens import TokenCounter
 from app.services.translations import TranslationService
 
@@ -89,3 +90,13 @@ async def get_translation_service(
     llm: LLMClient = Depends(get_llm_client),
 ) -> AsyncIterator[TranslationService]:
     yield TranslationService(session, settings, llm)
+
+
+async def get_task_service(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+    llm: LLMClient = Depends(get_llm_client),
+) -> AsyncIterator[TaskService]:
+    http_client = getattr(request.app.state, "http_client", None)
+    yield TaskService(session, settings, llm, http_client)

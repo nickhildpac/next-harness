@@ -1,17 +1,23 @@
-# Conversational AI Backend
+# Cue Task & Agent Backend
 
-Async FastAPI backend for durable, multi-conversation chat with a local-first LLM provider.
+Async FastAPI backend for **agentic task completion** with a local-first LLM. Users hand the app
+a goal; an agent loop reasons and calls tools until the goal is met (or the step budget runs out).
+
+Chat, notes, and translations still ship as secondary surfaces built on the same LLM port.
 
 ## Architecture
 
-This scaffold uses **LangGraph** rather than classic LangChain memory. The current graph is intentionally compact, but LangGraph is a better fit for stateful multi-turn flows because conversation state, prompt assembly, generation, and persistence can grow into explicit nodes without burying control flow inside one service method.
+Built on **LangGraph** so the agent's reason → act → observe loop lives as explicit nodes rather
+than a tangled service method.
 
-Layering:
+Layers:
 
-- API layer: FastAPI routers and dependency injection.
-- Service layer: conversation lifecycle, tone updates, message orchestration.
-- Orchestration layer: LangGraph chat workflow.
-- Ports/adapters: LLM client, memory store, repositories, token counting.
+- API layer: FastAPI routers and dependency injection (`/tasks`, `/tools`, `/conversations`, ...).
+- Service layer: `TaskService` runs an agent task end-to-end; `ConversationService` handles chat.
+- Orchestration layer: `AgentGraph` (task loop) and `ChatGraph` (chat turn).
+- Tool layer: `ToolRegistry` + built-in tools (`app/tools/builtins.py`) and a provider-neutral
+  `<tool_call>` protocol (`app/tools/protocol.py`) that works across every LLM adapter.
+- Ports/adapters: LLM client, repositories, token counting.
 
 ## Quickstart
 
@@ -23,20 +29,15 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload
 ```
 
-The backend can use either OpenRouter or Ollama through the same internal LLM port.
-`LLM_PROVIDER=openrouter` is the default; when `OPENROUTER_API_KEY` is not set, the
-app falls back to local Ollama automatically.
+Open `http://localhost:8000/` — you'll land on the task console. Enter a goal, keep or narrow the
+tool set, and press **Run task** to watch the agent's reasoning, tool calls, and results.
 
-```bash
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=openai/gpt-4o-mini
-```
+## LLM provider
 
-Per request, use `X-LLM-Provider: openrouter` or `X-LLM-Provider: ollama`; the
-same value is also accepted as `?llm_provider=openrouter`.
-
-Ollama is expected at `http://localhost:11434` with `llama3.1` available:
+Providers wired through the same `LLMClient` port: OpenRouter, OpenAI, Anthropic, Gemini, Ollama.
+`LLM_PROVIDER=openrouter` is the default; when `OPENROUTER_API_KEY` is unset, the app falls back to
+local Ollama automatically. Per-request override: `X-LLM-Provider: openai` (or
+`?llm_provider=openai`). Ollama is expected at `http://localhost:11434` with `llama3.1` pulled.
 
 ```bash
 ollama pull llama3.1
@@ -52,13 +53,24 @@ SQLite is the default for local development. Compose overrides `DATABASE_URL` to
 
 ## API
 
-- `POST /conversations`
-- `GET /conversations/{id}`
-- `PATCH /conversations/{id}/tone`
-- `POST /conversations/{id}/messages?stream=true`
-- `GET /conversations/{id}/messages`
-- `DELETE /conversations/{id}`
-- `GET /health`
-- `GET /health/llm`
+Task/agent surface (primary):
 
-Streaming uses Server-Sent Events.
+- `POST /tasks` — create + run an agent task. Body: `{"goal": "...", "user_id": "...", "max_steps": 8, "allowed_tools": ["list_notes", "create_note"]}`. Also accepts `prompt`/`objective`/`task` as goal aliases. Set `run: false` to persist without running.
+- `GET /tasks?user_id=...` — list past runs.
+- `GET /tasks/{task_id}` — inspect a run (status, `result_summary`, per-step trace).
+- `GET /tools` — introspect registered tools and their JSON parameter schemas.
+
+Chat/notes/translations surface (secondary):
+
+- `POST /conversations`, `GET /conversations/{id}`, `PATCH /conversations/{id}/tone`
+- `POST /conversations/{id}/messages?stream=true` (SSE)
+- `POST /conversations/{id}/suggest` (duo-only reply drafting)
+- `GET /conversations/{id}/messages`, `DELETE /conversations/{id}`
+- `POST /notes`, `POST /translations`
+- `GET /tones`, `GET /providers`, `GET /health`, `GET /health/llm`
+
+## Built-in tools
+
+`now`, `list_notes`, `get_note`, `create_note`, `list_translations`, `http_fetch`, `finish`. The
+`finish` tool is how the agent signals task completion — it always stays in scope even when
+`allowed_tools` is narrowed. Add your own by dropping a `Tool` into `app/tools/builtins.py:all_tools`.

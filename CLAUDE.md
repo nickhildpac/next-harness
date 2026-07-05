@@ -27,30 +27,43 @@ docker compose up --build
 
 ## Architecture
 
-Async FastAPI backend for durable, multi-conversation chat. Strict ports/adapters layering, wired
-top-to-bottom through FastAPI dependency injection (`app/api/dependencies.py`):
+Async FastAPI backend framed around **agentic task completion**: users submit goals, an agent
+loop reasons and calls tools until it reaches a `finish` step. Chat/tone/memory still exist as a
+secondary surface. Strict ports/adapters layering, wired top-to-bottom through FastAPI dependency
+injection (`app/api/dependencies.py`):
 
 ```
 routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
                     ↘ repositories/ → db/ (SQLAlchemy async)
+                    ↘ tools/ (registry + built-ins)
 ```
 
 - **`app/ports/llm.py`** — the `LLMClient` Protocol (`chat`, `stream_chat`, `health`) plus frozen
-  dataclasses (`ChatMessage`, `GenerationParams`, `LLMResult`). This is the single seam between the
-  app and any LLM. Everything above depends on the Protocol, never a concrete client.
-- **`app/adapters/`** — `OpenRouterClient` and `OllamaClient` both implement `LLMClient`.
-- **`app/orchestration/chat_graph.py`** — LangGraph wrapper (`ChatGraph`) around the LLM call.
-  Currently a single `generate` node; it exists so multi-step stateful flows can be added as nodes
-  rather than growing inside a service method.
-- **`app/services/conversations.py`** — `ConversationService` is the orchestrator: persists the user
-  message, resolves tone, builds context, runs the graph (or streams), persists the assistant reply,
-  triggers summarization, then commits. Holds both the sync (`send_message`) and SSE streaming
-  (`stream_message`) paths.
-- **`app/services/memory.py`** — `MemoryService` assembles LLM context: system prompt + rolling
-  summary + recent turn window, trimmed to `context_token_budget`. Rolls older turns into an
-  LLM-generated summary once unsummarized tokens exceed `summary_trigger_tokens`.
-- **`app/repositories/conversations.py`** — all DB access. Services never touch the session directly
-  for queries; they go through the repository and own the `commit`.
+  dataclasses (`ChatMessage`, `GenerationParams`, `LLMResult`, `ToolSpec`, `ToolCall`). This is the
+  single seam between the app and any LLM. Everything above depends on the Protocol.
+- **`app/adapters/`** — `OpenRouterClient`, `OllamaClient`, `OpenAIClient`, `AnthropicClient`,
+  `GeminiClient` all implement `LLMClient`.
+- **`app/tools/`** — provider-neutral tool layer. `registry.py` holds the `Tool`/`ToolRegistry`
+  types; `builtins.py` registers the default tools (`now`, `list_notes`, `get_note`, `create_note`,
+  `list_translations`, `http_fetch`, `finish`); `protocol.py` renders the tool manifest into a system
+  prompt and parses `<tool_call>{...}</tool_call>` JSON blocks out of assistant text — that
+  fenced-JSON contract is how tools work with every adapter, no provider-native tool API required.
+- **`app/orchestration/agent_graph.py`** — LangGraph loop with two nodes: `reason` (LLM turn) →
+  `act` (dispatch tool calls) → `reason` again. Exits when the model emits `finish`, produces a
+  reply with no tool calls, or hits `max_steps`.
+- **`app/orchestration/chat_graph.py`** — the older single-node LLM wrapper, retained for the chat
+  surface.
+- **`app/services/tasks.py`** — `TaskService` creates an `AgentTask`, runs the loop against a
+  (optionally scoped) tool registry, persists every reason/act step as an `AgentTaskStep`, and
+  finalizes status (`completed`/`failed`).
+- **`app/services/conversations.py`** — chat orchestrator (persist user message, resolve tone,
+  build context, run `ChatGraph` or stream, persist reply, summarize, commit). Still handles the
+  `assistant` and `duo` conversation kinds.
+- **`app/services/memory.py`** — `MemoryService` builds chat context: system prompt + rolling
+  summary + recent turn window trimmed to `context_token_budget`, with summarization when
+  unsummarized tokens exceed `summary_trigger_tokens`.
+- **`app/repositories/{conversations,notes,translations,tasks}.py`** — all DB access. Services never
+  touch the session directly for queries; they go through the repository and own the `commit`.
 
 ### LLM provider selection
 
@@ -67,8 +80,25 @@ the OpenRouter model is set inside its adapter. Ollama is expected at `localhost
 - SQLAlchemy 2.0 async. SQLite (`sqlite+aiosqlite:///./var/app.db`) for local dev; Compose overrides
   `DATABASE_URL` to Postgres (`asyncpg`). Tables are created via `Base.metadata.create_all` on
   startup — **there are no migrations**, so model changes need a fresh DB locally.
-- Models: `Conversation` 1:N `Message`, 1:1 `ConversationSummary`. `IdMixin`/`TimestampMixin` in
-  `app/db/base.py`.
+- Models: `Conversation` 1:N `Message`, 1:1 `ConversationSummary`; `AgentTask` 1:N `AgentTaskStep`;
+  `Note`, `Translation`. `IdMixin`/`TimestampMixin` in `app/db/base.py`.
+
+### Agent loop contract
+
+- The system prompt for a task run = agent preamble + tool manifest from `render_tool_manifest`. The
+  model is instructed to emit tool calls as `<tool_call>{"name":..., "arguments":{...}}</tool_call>`
+  blocks in its content. `parse_tool_calls` extracts them and treats the remaining text as visible
+  reasoning (persisted as a `thought` step).
+- One loop iteration = one `reason` LLM turn plus zero-or-more tool calls executed by `act`. If the
+  model returns *no* tool calls, that turn's text becomes the final answer (`final` step). If it
+  calls the built-in `finish` tool, the run completes with `finish.summary` as `result_summary`.
+- `max_steps` (default 8, capped at 32) counts reason turns; hitting it marks the task `failed`
+  with a step-limit error. Tool failures are surfaced back to the model as JSON error observations
+  so it can recover on the next turn.
+- Tools receive a `ToolContext(session, http_client, user_id, metadata)`. Handlers that touch the DB
+  use the same session as the request, so their writes commit atomically with the run's step log.
+- `allowed_tools` on the task request narrows the registry for that run (the `finish` tool is
+  always kept in scope). Omit it to expose everything the server registered.
 
 ### Conversation kinds
 
@@ -101,7 +131,18 @@ knobs: `context_token_budget` (6000), `summary_trigger_tokens` (4500), `window_t
 
 ## API surface
 
-`POST /conversations`, `GET /conversations/{id}`, `PATCH /conversations/{id}/tone`,
-`POST /conversations/{id}/messages?stream=true` (SSE), `POST /conversations/{id}/suggest`
-(duo only: LLM drafts a reply for a participant), `GET /conversations/{id}/messages`,
-`DELETE /conversations/{id}` (archive), `GET /tones`, `GET /health`, `GET /health/llm`.
+Task/agent surface (primary):
+- `POST /tasks` — create + run an agent task (`goal`, optional `user_id`, `max_steps`,
+  `allowed_tools`, `run=false` to just persist). Response is the full `TaskDetail` including every
+  step. `prompt`/`objective`/`task` are accepted as aliases for `goal`.
+- `GET /tasks?user_id=...`, `GET /tasks/{task_id}` — list and inspect runs.
+- `GET /tools` — introspect the registered tool set (name, description, JSON schema).
+
+Chat/notes/translations surface (secondary): `POST /conversations`, `GET /conversations/{id}`,
+`PATCH /conversations/{id}/tone`, `POST /conversations/{id}/messages?stream=true` (SSE),
+`POST /conversations/{id}/suggest` (duo-only reply drafting), `GET /conversations/{id}/messages`,
+`DELETE /conversations/{id}` (archive), `POST /notes`, `POST /translations`, `GET /tones`,
+`GET /providers`, `GET /health`, `GET /health/llm`.
+
+The static UI at `/` now lands on `/app/tasks.html` (goal + tool picker + step trace); the chat UI
+is still available at `/app/`.

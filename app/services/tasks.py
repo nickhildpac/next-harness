@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import logging
+
+import httpx
+from fastapi import HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import Settings
+from app.db.models import AgentTask, TaskStatus, TaskStepKind
+from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
+from app.ports.llm import GenerationParams, LLMClient
+from app.repositories.tasks import TaskRepository
+from app.schemas.task import TaskCreate, TaskDetail, TaskResponse, TaskStepResponse, ToolInfo
+from app.tools.registry import Tool, ToolContext, ToolRegistry, build_default_registry
+
+logger = logging.getLogger(__name__)
+
+
+class TaskService:
+    def __init__(
+        self,
+        session: AsyncSession,
+        settings: Settings,
+        llm: LLMClient,
+        http_client: httpx.AsyncClient | None,
+    ):
+        self.session = session
+        self.settings = settings
+        self.llm = llm
+        self.http_client = http_client
+        self.repo = TaskRepository(session)
+        self._registry = build_default_registry()
+
+    def available_tools(self) -> list[ToolInfo]:
+        return [
+            ToolInfo(name=spec.name, description=spec.description, parameters=spec.parameters)
+            for spec in self._registry.specs()
+        ]
+
+    async def create_task(self, payload: TaskCreate) -> TaskDetail:
+        registry = self._scoped_registry(payload.allowed_tools)
+        task = await self.repo.create(
+            user_id=payload.user_id,
+            goal=payload.goal,
+            max_steps=payload.max_steps,
+            allowed_tools=payload.allowed_tools,
+        )
+        if not payload.run:
+            await self.session.commit()
+            return await self._detail(task.id)
+
+        graph = AgentGraph(self.llm, registry, max_steps=payload.max_steps)
+        await self.repo.set_status(task, TaskStatus.running)
+        await self.session.commit()
+        run = await graph.run(
+            payload.goal,
+            self._params(),
+            ToolContext(session=self.session, http_client=self.http_client, user_id=payload.user_id),
+        )
+        await self._persist_run(task, run)
+        await self.session.commit()
+        logger.info(
+            "task_run_completed",
+            extra={
+                "task_id": task.id,
+                "status": task.status,
+                "turns_used": run.turns_used,
+                "step_limit_hit": run.step_limit_hit,
+            },
+        )
+        return await self._detail(task.id)
+
+    async def list_tasks(self, user_id: str) -> list[TaskResponse]:
+        tasks = await self.repo.list_for_user(user_id)
+        return [TaskResponse.model_validate(t) for t in tasks]
+
+    async def get_task(self, task_id: str) -> TaskDetail:
+        return await self._detail(task_id)
+
+    def _params(self) -> GenerationParams:
+        return GenerationParams(
+            model=self.settings.default_model,
+            temperature=0.2,
+            top_p=0.9,
+            timeout_seconds=self.settings.request_timeout_seconds,
+        )
+
+    def _scoped_registry(self, allowed: list[str] | None) -> ToolRegistry:
+        if not allowed:
+            return self._registry
+        allowed_set = set(allowed)
+        allowed_set.add("finish")  # finish is always reachable
+        tools: list[Tool] = []
+        for name in self._registry.names():
+            if name in allowed_set:
+                tool = self._registry.get(name)
+                if tool is not None:
+                    tools.append(tool)
+        if not tools:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="allowed_tools did not match any registered tool.",
+            )
+        return ToolRegistry(tools)
+
+    async def _persist_run(self, task: AgentTask, run: AgentRun) -> None:
+        for index, step in enumerate(run.steps):
+            await self.repo.add_step(
+                task,
+                step_index=index,
+                kind=self._step_kind(step),
+                tool_name=step.tool_name,
+                content=step.content,
+                payload=step.payload,
+                ok=step.ok,
+            )
+        await self.repo.bump_steps(task, run.turns_used)
+        if run.errored:
+            await self.repo.set_status(
+                task, TaskStatus.failed, error=run.error, model=run.model
+            )
+        elif run.completed:
+            await self.repo.set_status(
+                task,
+                TaskStatus.completed,
+                result_summary=run.final_summary,
+                model=run.model,
+            )
+        elif run.step_limit_hit:
+            await self.repo.set_status(
+                task,
+                TaskStatus.failed,
+                error=f"step limit ({task.max_steps}) reached before task completion",
+                model=run.model,
+            )
+        else:
+            await self.repo.set_status(task, TaskStatus.failed, error="run ended without a result", model=run.model)
+
+    def _step_kind(self, step: StepRecord) -> TaskStepKind:
+        return TaskStepKind(step.kind)
+
+    async def _detail(self, task_id: str) -> TaskDetail:
+        task = await self.repo.get_with_steps(task_id)
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        return TaskDetail(
+            **TaskResponse.model_validate(task).model_dump(),
+            steps=[TaskStepResponse.model_validate(s) for s in task.steps],
+        )

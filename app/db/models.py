@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, IdMixin, TimestampMixin
@@ -93,4 +93,60 @@ class Translation(Base, IdMixin, TimestampMixin):
     romanized_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class TaskStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class TaskStepKind(str, Enum):
+    thought = "thought"
+    tool_call = "tool_call"
+    tool_result = "tool_result"
+    final = "final"
+    error = "error"
+
+
+class AgentTask(Base, IdMixin, TimestampMixin):
+    __tablename__ = "agent_tasks"
+    __table_args__ = (Index("ix_agent_tasks_user_updated", "user_id", "updated_at"),)
+
+    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default=TaskStatus.pending.value, nullable=False, index=True
+    )
+    max_steps: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
+    steps_taken: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    allowed_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    steps: Mapped[list["AgentTaskStep"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="AgentTaskStep.step_index",
+    )
+
+
+class AgentTaskStep(Base, IdMixin, TimestampMixin):
+    __tablename__ = "agent_task_steps"
+    __table_args__ = (Index("ix_agent_task_steps_task_index", "task_id", "step_index"),)
+
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    task: Mapped[AgentTask] = relationship(back_populates="steps")
 
