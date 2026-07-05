@@ -106,30 +106,68 @@ def test_gemini_provider_used_when_key_configured():
     assert isinstance(client, GeminiClient)
 
 
-def test_cloud_provider_falls_back_to_openrouter_when_key_missing():
-    from app.adapters.openrouter import OpenRouterClient
+def test_unconfigured_cloud_provider_raises_instead_of_silently_substituting():
+    from fastapi import HTTPException
     from app.api.dependencies import build_llm_client
     from app.core.config import Settings
 
-    client = build_llm_client(
-        Settings(openai_api_key=None, openrouter_api_key="test-key"),
-        provider="openai",
-    )
+    # openai has no documented fallback contract (unlike openrouter/auto), so requesting it
+    # without OPENAI_API_KEY must fail loudly rather than silently serving OpenRouter's model.
+    try:
+        build_llm_client(
+            Settings(openai_api_key=None, openrouter_api_key="test-key"),
+            provider="openai",
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert "openai" in exc.detail
+        assert "OPENAI_API_KEY" in exc.detail
 
-    assert isinstance(client, OpenRouterClient)
+
+def test_unconfigured_cloud_provider_raises_even_with_no_fallback_available():
+    from fastapi import HTTPException
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    try:
+        build_llm_client(
+            Settings(anthropic_api_key=None, openrouter_api_key=None),
+            provider="anthropic",
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert "anthropic" in exc.detail
+        assert "ANTHROPIC_API_KEY" in exc.detail
 
 
-def test_cloud_provider_falls_through_to_ollama_when_no_cloud_keys():
+def test_unconfigured_gemini_provider_raises():
+    from fastapi import HTTPException
+    from app.api.dependencies import build_llm_client
+    from app.core.config import Settings
+
+    try:
+        build_llm_client(Settings(gemini_api_key=None), provider="gemini")
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert "gemini" in exc.detail
+        assert "GEMINI_API_KEY" in exc.detail
+
+
+def test_openrouter_and_auto_still_fall_back_silently_when_unconfigured():
+    """Only openrouter/auto keep the documented silent-fallback-to-Ollama contract."""
     from app.adapters.ollama import OllamaClient
     from app.api.dependencies import build_llm_client
     from app.core.config import Settings
 
-    client = build_llm_client(
-        Settings(anthropic_api_key=None, openrouter_api_key=None),
-        provider="anthropic",
-    )
+    settings = Settings(openrouter_api_key=None)
 
-    assert isinstance(client, OllamaClient)
+    assert isinstance(
+        build_llm_client(settings, provider="openrouter"), OllamaClient
+    )
+    assert isinstance(build_llm_client(settings, provider="auto"), OllamaClient)
 
 
 def test_providers_endpoint_reports_availability():

@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator
 
 import httpx
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request, status
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,17 +42,35 @@ def build_llm_client(
     if requested == "ollama":
         return OllamaClient(settings, token_counter, http_client)
 
-    if requested == "openai" and _has_key(settings.openai_api_key):
-        return OpenAIClient(settings, token_counter, http_client)
-    if requested == "anthropic" and _has_key(settings.anthropic_api_key):
-        return AnthropicClient(settings, token_counter, http_client)
-    if requested == "gemini" and _has_key(settings.gemini_api_key):
-        return GeminiClient(settings, token_counter, http_client)
+    # These providers have no documented silent-fallback contract (unlike openrouter/auto,
+    # which CLAUDE.md explicitly promises falls back to Ollama). Requesting one of them
+    # without its key configured must fail loudly instead of quietly serving a different
+    # provider/model with no signal to the caller.
+    if requested == "openai":
+        if _has_key(settings.openai_api_key):
+            return OpenAIClient(settings, token_counter, http_client)
+        raise _unconfigured_provider_error("openai", "OPENAI_API_KEY")
+    if requested == "anthropic":
+        if _has_key(settings.anthropic_api_key):
+            return AnthropicClient(settings, token_counter, http_client)
+        raise _unconfigured_provider_error("anthropic", "ANTHROPIC_API_KEY")
+    if requested == "gemini":
+        if _has_key(settings.gemini_api_key):
+            return GeminiClient(settings, token_counter, http_client)
+        raise _unconfigured_provider_error("gemini", "GEMINI_API_KEY")
 
+    # requested == "openrouter" or "auto": documented to fall back to Ollama when unconfigured.
     if _has_key(settings.openrouter_api_key):
         return OpenRouterClient(settings, token_counter, http_client)
 
     return OllamaClient(settings, token_counter, http_client)
+
+
+def _unconfigured_provider_error(provider_id: str, env_var: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"LLM provider '{provider_id}' was requested but {env_var} is not configured.",
+    )
 
 
 def _requested_provider(request: Request) -> str | None:
