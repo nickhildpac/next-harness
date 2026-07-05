@@ -17,6 +17,8 @@ class ConversationRepository:
         tone_name: str,
         custom_persona: str | None,
         second_user_id: str | None = None,
+        participant_user_id: str | None = None,
+        participant_second_user_id: str | None = None,
         kind: str = ConversationKind.assistant.value,
         use_documents: bool = False,
     ) -> Conversation:
@@ -26,6 +28,8 @@ class ConversationRepository:
             tone_name=tone_name,
             custom_persona=custom_persona,
             second_user_id=second_user_id,
+            participant_user_id=participant_user_id,
+            participant_second_user_id=participant_second_user_id,
             kind=kind,
             use_documents=use_documents,
         )
@@ -53,6 +57,14 @@ class ConversationRepository:
         stmt = (
             select(Conversation)
             .where(Conversation.is_archived.is_(False))
+            .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
+        )
+        return list(await self.session.scalars(stmt))
+
+    async def list_for_user(self, user_id: str) -> list[Conversation]:
+        stmt = (
+            select(Conversation)
+            .where(Conversation.user_id == user_id, Conversation.is_archived.is_(False))
             .order_by(Conversation.updated_at.desc(), Conversation.created_at.desc())
         )
         return list(await self.session.scalars(stmt))

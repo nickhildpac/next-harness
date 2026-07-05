@@ -19,11 +19,21 @@ class ConversationKind(str, Enum):
     duo = "duo"  # two users chatting; the LLM drafts replies on request
 
 
+class User(Base, IdMixin, TimestampMixin):
+    __tablename__ = "users"
+
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class Conversation(Base, IdMixin, TimestampMixin):
     __tablename__ = "conversations"
 
     user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     second_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    participant_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    participant_second_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     kind: Mapped[str] = mapped_column(
         String(32), default=ConversationKind.assistant.value, nullable=False
     )
@@ -77,15 +87,19 @@ class ConversationSummary(Base, IdMixin, TimestampMixin):
 class Document(Base, IdMixin, TimestampMixin):
     __tablename__ = "documents"
 
-    conversation_id: Mapped[str] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True, nullable=True
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    conversation: Mapped[Conversation] = relationship(back_populates="documents")
+    conversation: Mapped[Conversation | None] = relationship(back_populates="documents")
+    task: Mapped["AgentTask | None"] = relationship(back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
@@ -101,7 +115,8 @@ class DocumentChunk(Base, IdMixin, TimestampMixin):
         ForeignKey("documents.id", ondelete="CASCADE"), index=True, nullable=False
     )
     # Denormalized so retrieval can join hits to rows without going through documents.
-    conversation_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 1-based; None for txt/md
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -173,6 +188,9 @@ class AgentTask(Base, IdMixin, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="AgentTaskStep.step_index",
     )
+    documents: Mapped[list[Document]] = relationship(
+        back_populates="task", cascade="all, delete-orphan"
+    )
 
 
 class AgentTaskStep(Base, IdMixin, TimestampMixin):
@@ -190,4 +208,3 @@ class AgentTaskStep(Base, IdMixin, TimestampMixin):
     ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     task: Mapped[AgentTask] = relationship(back_populates="steps")
-

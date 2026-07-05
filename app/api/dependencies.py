@@ -13,11 +13,13 @@ from app.adapters.openai import OpenAIClient
 from app.adapters.openai_embeddings import OpenAIEmbeddingsClient
 from app.adapters.openrouter import OpenRouterClient
 from app.core.config import Settings, get_settings
+from app.db.models import User
 from app.db.session import get_session
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import LLMClient
 from app.ports.vectorstore import VectorStore
 from app.services.conversations import ConversationService
+from app.services.auth import AuthService, decode_access_token
 from app.services.notes import NoteService
 from app.services.rag import RagService
 from app.services.tasks import TaskService
@@ -25,6 +27,31 @@ from app.services.tokens import TokenCounter
 from app.services.translations import TranslationService
 
 SUPPORTED_PROVIDERS = {"openrouter", "ollama", "auto", "openai", "anthropic", "gemini"}
+
+
+async def get_auth_service(
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> AsyncIterator[AuthService]:
+    yield AuthService(session, settings)
+
+
+async def get_current_user(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> User:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
+        )
+    user_id = decode_access_token(token, settings.auth_secret_key)
+    user = await AuthService(session, settings).user_by_id(user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    return user
 
 
 def get_llm_client(
@@ -154,6 +181,8 @@ async def get_task_service(
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
     llm: LLMClient = Depends(get_llm_client),
+    embeddings: EmbeddingsClient = Depends(get_embeddings_client),
+    vectorstore: VectorStore = Depends(get_vector_store),
 ) -> AsyncIterator[TaskService]:
     http_client = getattr(request.app.state, "http_client", None)
-    yield TaskService(session, settings, llm, http_client)
+    yield TaskService(session, settings, llm, http_client, embeddings, vectorstore)

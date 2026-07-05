@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     environment: str = "dev"
     log_level: str = "INFO"
     database_url: str = "sqlite+aiosqlite:///./var/app.db"
+    auth_secret_key: str = "change-me-local-dev-secret"
+    auth_token_ttl_minutes: int = 60 * 24
+    auth_allow_signup: bool = True
 
     llm_provider: Literal[
         "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"

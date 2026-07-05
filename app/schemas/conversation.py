@@ -96,6 +96,8 @@ class ConversationResponse(BaseModel):
     id: str
     user_id: str
     second_user_id: str | None = None
+    participant_user_id: str | None = None
+    participant_second_user_id: str | None = None
     kind: str = "assistant"
     title: str | None
     tone_name: str

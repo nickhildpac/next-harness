@@ -39,7 +39,10 @@ class ChromaVectorStore(VectorStore):
             documents=[record.text for record in records],
             metadatas=[
                 {
-                    "conversation_id": record.conversation_id,
+                    "scope_type": record.scope_type,
+                    "scope_id": record.scope_id,
+                    # Backward-compatible metadata for existing conversation vectors.
+                    "conversation_id": record.scope_id if record.scope_type == "conversation" else "",
                     "document_id": record.document_id,
                     "chunk_index": record.chunk_index,
                     # Chroma metadata values cannot be None.
@@ -50,12 +53,12 @@ class ChromaVectorStore(VectorStore):
         )
 
     async def query(
-        self, embedding: list[float], *, conversation_id: str, top_k: int
+        self, embedding: list[float], *, scope_type: str, scope_id: str, top_k: int
     ) -> list[RetrievedChunk]:
-        return await asyncio.to_thread(self._query_sync, embedding, conversation_id, top_k)
+        return await asyncio.to_thread(self._query_sync, embedding, scope_type, scope_id, top_k)
 
     def _query_sync(
-        self, embedding: list[float], conversation_id: str, top_k: int
+        self, embedding: list[float], scope_type: str, scope_id: str, top_k: int
     ) -> list[RetrievedChunk]:
         collection = self._get_collection()
         available = collection.count()
@@ -64,7 +67,7 @@ class ChromaVectorStore(VectorStore):
         result = collection.query(
             query_embeddings=[embedding],
             n_results=min(top_k, available),
-            where={"conversation_id": conversation_id},
+            where={"$and": [{"scope_type": scope_type}, {"scope_id": scope_id}]},
             include=["documents", "metadatas", "distances"],
         )
         ids = result["ids"][0] if result["ids"] else []
@@ -90,6 +93,11 @@ class ChromaVectorStore(VectorStore):
         )
 
     async def delete_conversation(self, conversation_id: str) -> None:
+        await self.delete_scope("conversation", conversation_id)
+
+    async def delete_scope(self, scope_type: str, scope_id: str) -> None:
         await asyncio.to_thread(
-            lambda: self._get_collection().delete(where={"conversation_id": conversation_id})
+            lambda: self._get_collection().delete(
+                where={"$and": [{"scope_type": scope_type}, {"scope_id": scope_id}]}
+            )
         )

@@ -4,10 +4,11 @@ import logging
 from dataclasses import dataclass
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.db.models import Document
+from app.db.models import AgentTask, Document
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.vectorstore import ChunkRecord, VectorStore
 from app.repositories.conversations import ConversationRepository
@@ -51,9 +52,44 @@ class RagService:
         self.token_counter = TokenCounter()
 
     async def ingest(
-        self, conversation_id: str, *, filename: str, content_type: str | None, data: bytes
+        self,
+        conversation_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+        owner_user_id: str | None = None,
     ) -> Document:
-        await self._conversation_or_404(conversation_id)
+        await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
+        return await self._ingest(
+            scope_type="conversation",
+            scope_id=conversation_id,
+            filename=filename,
+            content_type=content_type,
+            data=data,
+        )
+
+    async def ingest_task_document(
+        self, task_id: str, *, filename: str, content_type: str | None, data: bytes
+    ) -> Document:
+        await self._task_or_404(task_id)
+        return await self._ingest(
+            scope_type="task",
+            scope_id=task_id,
+            filename=filename,
+            content_type=content_type,
+            data=data,
+        )
+
+    async def _ingest(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+    ) -> Document:
         if len(data) > self.settings.rag_max_upload_bytes:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -67,7 +103,8 @@ class RagService:
                 detail="Document contains no extractable text.",
             )
         document = await self.repo.add_document(
-            conversation_id=conversation_id,
+            conversation_id=scope_id if scope_type == "conversation" else None,
+            task_id=scope_id if scope_type == "task" else None,
             filename=filename,
             content_type=content_type,
             size_bytes=len(data),
@@ -81,7 +118,8 @@ class RagService:
                         id=row.id,
                         text=row.text,
                         embedding=vector,
-                        conversation_id=conversation_id,
+                        scope_type=scope_type,
+                        scope_id=scope_id,
                         document_id=document.id,
                         chunk_index=row.chunk_index,
                         page=row.page,
@@ -96,11 +134,20 @@ class RagService:
             raise
         return document
 
-    async def list_documents(self, conversation_id: str) -> list[Document]:
-        await self._conversation_or_404(conversation_id)
+    async def list_documents(
+        self, conversation_id: str, owner_user_id: str | None = None
+    ) -> list[Document]:
+        await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         return await self.repo.list_by_conversation(conversation_id)
 
-    async def delete_document(self, conversation_id: str, document_id: str) -> None:
+    async def list_task_documents(self, task_id: str) -> list[Document]:
+        await self._task_or_404(task_id)
+        return await self.repo.list_by_task(task_id)
+
+    async def delete_document(
+        self, conversation_id: str, document_id: str, owner_user_id: str | None = None
+    ) -> None:
+        await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         document = await self.repo.get(document_id, conversation_id)
         if document is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
@@ -113,16 +160,43 @@ class RagService:
     async def retrieve(
         self, conversation_id: str, query: str, token_budget: int
     ) -> list[CitedChunk]:
+        return await self._retrieve(
+            scope_type="conversation",
+            scope_id=conversation_id,
+            query=query,
+            token_budget=token_budget,
+        )
+
+    async def retrieve_task(
+        self, task_id: str, query: str, token_budget: int
+    ) -> list[CitedChunk]:
+        return await self._retrieve(
+            scope_type="task",
+            scope_id=task_id,
+            query=query,
+            token_budget=token_budget,
+        )
+
+    async def _retrieve(
+        self, *, scope_type: str, scope_id: str, query: str, token_budget: int
+    ) -> list[CitedChunk]:
         if token_budget <= 0:
             return []
         # No documents means nothing to retrieve; skip the embedding round-trip so a
         # doc-less conversation with the flag on still chats normally (even without a key).
-        if not await self.repo.has_documents(conversation_id):
+        if scope_type == "conversation":
+            has_documents = await self.repo.has_documents(scope_id)
+        else:
+            has_documents = await self.repo.has_task_documents(scope_id)
+        if not has_documents:
             return []
         try:
             query_vector = (await self._embed([query]))[0]
             hits = await self.vectorstore.query(
-                query_vector, conversation_id=conversation_id, top_k=self.settings.rag_top_k
+                query_vector,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                top_k=self.settings.rag_top_k,
             )
         except HTTPException:
             raise
@@ -196,11 +270,20 @@ class RagService:
                 detail="Embeddings provider is unavailable or not configured.",
             ) from exc
 
-    async def _conversation_or_404(self, conversation_id: str) -> None:
-        if await self.conversations.get(conversation_id) is None:
+    async def _conversation_or_404(
+        self, conversation_id: str, owner_user_id: str | None = None
+    ) -> None:
+        conversation = await self.conversations.get(conversation_id)
+        if conversation is None or (
+            owner_user_id is not None and conversation.user_id != owner_user_id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
             )
+
+    async def _task_or_404(self, task_id: str) -> None:
+        if await self.session.scalar(select(AgentTask.id).where(AgentTask.id == task_id)) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     async def _delete_vectors(self, document_id: str) -> None:
         try:

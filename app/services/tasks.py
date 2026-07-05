@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.db.models import AgentTask, TaskStatus, TaskStepKind
 from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
+from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import GenerationParams, LLMClient
+from app.ports.vectorstore import VectorStore
 from app.repositories.tasks import TaskRepository
 from app.schemas.task import TaskCreate, TaskDetail, TaskResponse, TaskStepResponse, ToolInfo
 from app.tools.registry import Tool, ToolContext, ToolRegistry, build_default_registry
@@ -24,11 +26,15 @@ class TaskService:
         settings: Settings,
         llm: LLMClient,
         http_client: httpx.AsyncClient | None,
+        embeddings: EmbeddingsClient | None = None,
+        vectorstore: VectorStore | None = None,
     ):
         self.session = session
         self.settings = settings
         self.llm = llm
         self.http_client = http_client
+        self.embeddings = embeddings
+        self.vectorstore = vectorstore
         self.repo = TaskRepository(session)
         self._registry = build_default_registry()
 
@@ -56,7 +62,16 @@ class TaskService:
         run = await graph.run(
             payload.goal,
             self._params(),
-            ToolContext(session=self.session, http_client=self.http_client, user_id=payload.user_id),
+            ToolContext(
+                session=self.session,
+                http_client=self.http_client,
+                user_id=payload.user_id,
+                task_id=task.id,
+                settings=self.settings,
+                llm=self.llm,
+                embeddings=self.embeddings,
+                vectorstore=self.vectorstore,
+            ),
         )
         await self._persist_run(task, run)
         await self.session.commit()
@@ -75,8 +90,8 @@ class TaskService:
         tasks = await self.repo.list_for_user(user_id)
         return [TaskResponse.model_validate(t) for t in tasks]
 
-    async def get_task(self, task_id: str) -> TaskDetail:
-        return await self._detail(task_id)
+    async def get_task(self, task_id: str, user_id: str | None = None) -> TaskDetail:
+        return await self._detail(task_id, user_id)
 
     def _params(self) -> GenerationParams:
         return GenerationParams(
@@ -140,9 +155,9 @@ class TaskService:
     def _step_kind(self, step: StepRecord) -> TaskStepKind:
         return TaskStepKind(step.kind)
 
-    async def _detail(self, task_id: str) -> TaskDetail:
+    async def _detail(self, task_id: str, user_id: str | None = None) -> TaskDetail:
         task = await self.repo.get_with_steps(task_id)
-        if task is None:
+        if task is None or (user_id is not None and task.user_id != user_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
         return TaskDetail(
             **TaskResponse.model_validate(task).model_dump(),

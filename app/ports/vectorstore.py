@@ -9,7 +9,8 @@ class ChunkRecord:
     id: str
     text: str
     embedding: list[float]
-    conversation_id: str
+    scope_type: str
+    scope_id: str
     document_id: str
     chunk_index: int
     page: int | None
@@ -28,7 +29,7 @@ class RetrievedChunk:
 
 
 class VectorStore(Protocol):
-    """Vector index for document chunks, scoped by conversation.
+    """Vector index for document chunks, scoped by conversation or task.
 
     The default adapter is embedded Chroma (`app/adapters/chroma.py`). Deployments already on
     Postgres can swap in a pgvector implementation (embedding column on document_chunks) by
@@ -38,11 +39,13 @@ class VectorStore(Protocol):
     async def upsert(self, records: list[ChunkRecord]) -> None: ...
 
     async def query(
-        self, embedding: list[float], *, conversation_id: str, top_k: int
+        self, embedding: list[float], *, scope_type: str, scope_id: str, top_k: int
     ) -> list[RetrievedChunk]:
-        """Top-k most similar chunks in the conversation, sorted by score descending."""
+        """Top-k most similar chunks in the scope, sorted by score descending."""
         ...
 
     async def delete_document(self, document_id: str) -> None: ...
 
     async def delete_conversation(self, conversation_id: str) -> None: ...
+
+    async def delete_scope(self, scope_type: str, scope_id: str) -> None: ...

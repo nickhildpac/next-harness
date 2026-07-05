@@ -26,6 +26,7 @@ from app.schemas.conversation import (
 )
 from app.schemas.document import Citation
 from app.services.memory import MemoryService
+from app.services.llm_errors import llm_error_detail
 from app.services.rag import CitedChunk, RagService
 from app.services.tokens import TokenCounter
 from app.services.tones import ToneService
@@ -60,12 +61,17 @@ class ConversationService:
         )
         self.graph = ChatGraph(llm)
 
-    async def create(self, payload: ConversationCreate) -> ConversationResponse:
+    async def create(
+        self, payload: ConversationCreate, owner_user_id: str | None = None
+    ) -> ConversationResponse:
         if payload.participants:
-            user_id, second_user_id = payload.participants
+            participant_user_id, participant_second_user_id = payload.participants
+            user_id = owner_user_id or participant_user_id
+            second_user_id = participant_second_user_id
             kind = ConversationKind.duo.value
         else:
-            user_id, second_user_id = payload.user_id, None
+            user_id, second_user_id = owner_user_id or payload.user_id, None
+            participant_user_id = participant_second_user_id = None
             kind = ConversationKind.assistant.value
         conversation = await self.repo.create(
             user_id=user_id,
@@ -73,18 +79,26 @@ class ConversationService:
             tone_name=payload.tone.tone_name,
             custom_persona=payload.tone.custom_persona,
             second_user_id=second_user_id,
+            participant_user_id=participant_user_id,
+            participant_second_user_id=participant_second_user_id,
             kind=kind,
             use_documents=payload.use_documents,
         )
         await self.session.commit()
         return ConversationResponse.model_validate(conversation)
 
-    async def list_all(self) -> list[ConversationResponse]:
-        conversations = await self.repo.list_all()
+    async def list_all(self, owner_user_id: str | None = None) -> list[ConversationResponse]:
+        conversations = (
+            await self.repo.list_for_user(owner_user_id)
+            if owner_user_id is not None
+            else await self.repo.list_all()
+        )
         return [ConversationResponse.model_validate(conversation) for conversation in conversations]
 
-    async def get(self, conversation_id: str) -> ConversationDetail:
-        conversation = await self._conversation_or_404(conversation_id, with_messages=True)
+    async def get(self, conversation_id: str, owner_user_id: str | None = None) -> ConversationDetail:
+        conversation = await self._conversation_or_404(
+            conversation_id, with_messages=True, owner_user_id=owner_user_id
+        )
         return ConversationDetail(
             **ConversationResponse.model_validate(conversation).model_dump(),
             messages=[self._message_response(message) for message in conversation.messages],
@@ -92,9 +106,9 @@ class ConversationService:
         )
 
     async def update_tone(
-        self, conversation_id: str, payload: ConversationToneUpdate
+        self, conversation_id: str, payload: ConversationToneUpdate, owner_user_id: str | None = None
     ) -> ConversationResponse:
-        conversation = await self._conversation_or_404(conversation_id)
+        conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         updated = await self.repo.update_tone(
             conversation, tone_name=payload.tone_name, custom_persona=payload.custom_persona
         )
@@ -102,29 +116,33 @@ class ConversationService:
         return ConversationResponse.model_validate(updated)
 
     async def update_rag(
-        self, conversation_id: str, payload: ConversationRagUpdate
+        self, conversation_id: str, payload: ConversationRagUpdate, owner_user_id: str | None = None
     ) -> ConversationResponse:
-        conversation = await self._conversation_or_404(conversation_id)
+        conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         updated = await self.repo.update_use_documents(
             conversation, use_documents=payload.use_documents
         )
         await self.session.commit()
         return ConversationResponse.model_validate(updated)
 
-    async def archive(self, conversation_id: str) -> None:
-        conversation = await self._conversation_or_404(conversation_id)
+    async def archive(self, conversation_id: str, owner_user_id: str | None = None) -> None:
+        conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         await self.repo.archive(conversation)
         await self.session.commit()
 
-    async def delete_message(self, conversation_id: str, message_id: str) -> None:
-        await self._conversation_or_404(conversation_id)
+    async def delete_message(
+        self, conversation_id: str, message_id: str, owner_user_id: str | None = None
+    ) -> None:
+        await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         deleted = await self.repo.delete_message(message_id, conversation_id)
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
         await self.session.commit()
 
-    async def list_messages(self, conversation_id: str, limit: int, offset: int) -> PaginatedMessages:
-        await self._conversation_or_404(conversation_id)
+    async def list_messages(
+        self, conversation_id: str, limit: int, offset: int, owner_user_id: str | None = None
+    ) -> PaginatedMessages:
+        await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         messages, total = await self.repo.list_messages(conversation_id, limit=limit, offset=offset)
         return PaginatedMessages(
             items=[self._message_response(message) for message in messages],
@@ -133,11 +151,13 @@ class ConversationService:
             total=total,
         )
 
-    async def send_message(self, conversation_id: str, payload: MessageCreate) -> ChatResponse:
-        conversation = await self._conversation_or_404(conversation_id)
+    async def send_message(
+        self, conversation_id: str, payload: MessageCreate, owner_user_id: str | None = None
+    ) -> ChatResponse:
+        conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         if conversation.kind == ConversationKind.duo:
             return await self._send_duo_message(conversation, payload)
-        user_id = self._message_user_id(conversation, payload)
+        user_id = owner_user_id or self._message_user_id(conversation, payload)
         tone = self.tones.resolve(payload.tone_override, conversation.tone_name, conversation.custom_persona)
         # Build context before persisting the new message so it appears exactly once,
         # and so a context-budget rejection leaves nothing behind in the DB.
@@ -182,17 +202,17 @@ class ConversationService:
         )
 
     async def stream_message(
-        self, conversation_id: str, payload: MessageCreate
+        self, conversation_id: str, payload: MessageCreate, owner_user_id: str | None = None
     ) -> AsyncIterator[str]:
         try:
-            conversation = await self._conversation_or_404(conversation_id)
+            conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
             if conversation.kind == ConversationKind.duo:
                 response = await self._send_duo_message(conversation, payload)
                 yield self._sse("message", {"role": "user", "id": response.user_message.id})
                 yield self._sse("done", {"user_message_id": response.user_message.id})
                 yield "data: [DONE]\n\n"
                 return
-            user_id = self._message_user_id(conversation, payload)
+            user_id = owner_user_id or self._message_user_id(conversation, payload)
             tone = self.tones.resolve(
                 payload.tone_override, conversation.tone_name, conversation.custom_persona
             )
@@ -254,10 +274,10 @@ class ConversationService:
             await self.session.rollback()
             yield self._sse("error", {"error": exc.detail})
             yield "data: [DONE]\n\n"
-        except Exception:
+        except Exception as exc:
             await self.session.rollback()
             logger.exception("stream_message_failed", extra={"conversation_id": conversation_id})
-            yield self._sse("error", {"error": "Local LLM is unavailable or timed out."})
+            yield self._sse("error", {"error": llm_error_detail(self.llm, exc)})
             yield "data: [DONE]\n\n"
 
     async def _generate(self, messages: list[ChatMessage], temperature: float, top_p: float) -> LLMResult:
@@ -269,14 +289,18 @@ class ConversationService:
         )
         try:
             return await self.graph.run(messages, params)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Local LLM is unavailable or timed out.",
+                detail=llm_error_detail(self.llm, exc),
             ) from exc
 
-    async def suggest_reply(self, conversation_id: str, payload: SuggestRequest) -> SuggestResponse:
-        conversation = await self._conversation_or_404(conversation_id)
+    async def suggest_reply(
+        self, conversation_id: str, payload: SuggestRequest, owner_user_id: str | None = None
+    ) -> SuggestResponse:
+        conversation = await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         if conversation.kind != ConversationKind.duo:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -363,8 +387,11 @@ class ConversationService:
         )
 
     def _participants(self, conversation: Conversation) -> list[str]:
-        participants = [conversation.user_id]
-        if conversation.second_user_id:
+        first = conversation.participant_user_id or conversation.user_id
+        participants = [first]
+        if conversation.participant_second_user_id:
+            participants.append(conversation.participant_second_user_id)
+        elif conversation.second_user_id:
             participants.append(conversation.second_user_id)
         return participants
 
@@ -419,13 +446,17 @@ class ConversationService:
             )
 
     async def _conversation_or_404(
-        self, conversation_id: str, *, with_messages: bool = False
+        self,
+        conversation_id: str,
+        *,
+        with_messages: bool = False,
+        owner_user_id: str | None = None,
     ) -> Conversation:
         if with_messages:
             conversation = await self.repo.get_with_messages(conversation_id)
         else:
             conversation = await self.repo.get(conversation_id)
-        if not conversation:
+        if not conversation or (owner_user_id is not None and conversation.user_id != owner_user_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
         return conversation
 

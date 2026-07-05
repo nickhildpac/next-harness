@@ -7,7 +7,8 @@ class DocumentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    conversation_id: str
+    conversation_id: str | None = None
+    task_id: str | None = None
     filename: str
     content_type: str | None = None
     size_bytes: int

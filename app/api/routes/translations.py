@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
-from app.api.dependencies import get_translation_service
+from app.api.dependencies import get_current_user, get_translation_service
+from app.db.models import User
 from app.schemas.translation import TranslateResponse, TranslationCreate, TranslationResponse
 from app.services.translations import TranslationService
 
@@ -31,32 +32,34 @@ async def list_languages() -> list[dict[str, str]]:
 @router.post("/translations", response_model=TranslateResponse, status_code=201)
 async def create_translation(
     payload: TranslationCreate,
+    current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
 ) -> TranslateResponse:
+    payload = payload.model_copy(update={"user_id": current_user.id})
     return await service.translate(payload)
 
 
 @router.get("/translations", response_model=list[TranslationResponse])
 async def list_translations(
-    user_id: str = "anonymous",
+    current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
 ) -> list[TranslationResponse]:
-    return await service.list_for_user(user_id)
+    return await service.list_for_user(current_user.id)
 
 
 @router.get("/translations/{translation_id}", response_model=TranslationResponse)
 async def get_translation(
     translation_id: str,
-    user_id: str = "anonymous",
+    current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
 ) -> TranslationResponse:
-    return await service.get(translation_id, user_id)
+    return await service.get(translation_id, current_user.id)
 
 
 @router.delete("/translations/{translation_id}", status_code=204)
 async def delete_translation(
     translation_id: str,
-    user_id: str = "anonymous",
+    current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
 ) -> None:
-    await service.delete(translation_id, user_id)
+    await service.delete(translation_id, current_user.id)

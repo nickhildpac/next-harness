@@ -7,7 +7,11 @@ from typing import Any
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
+from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import ToolSpec
+from app.ports.llm import LLMClient
+from app.ports.vectorstore import VectorStore
 
 
 class ToolError(RuntimeError):
@@ -21,6 +25,11 @@ class ToolContext:
     session: AsyncSession | None = None
     http_client: httpx.AsyncClient | None = None
     user_id: str | None = None
+    task_id: str | None = None
+    settings: Settings | None = None
+    llm: LLMClient | None = None
+    embeddings: EmbeddingsClient | None = None
+    vectorstore: VectorStore | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

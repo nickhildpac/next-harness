@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, Query, Response, status
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import get_conversation_service
+from app.api.dependencies import get_conversation_service, get_current_user
+from app.db.models import User
 from app.schemas.conversation import (
     ChatResponse,
     ConversationCreate,
@@ -22,42 +23,47 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
 async def create_conversation(
     payload: ConversationCreate,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationResponse:
-    return await service.create(payload)
+    return await service.create(payload, current_user.id)
 
 
 @router.get("", response_model=list[ConversationResponse])
 async def list_conversations(
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> list[ConversationResponse]:
-    return await service.list_all()
+    return await service.list_all(current_user.id)
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetail)
 async def get_conversation(
     conversation_id: str,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationDetail:
-    return await service.get(conversation_id)
+    return await service.get(conversation_id, current_user.id)
 
 
 @router.patch("/{conversation_id}/tone", response_model=ConversationResponse)
 async def update_tone(
     conversation_id: str,
     payload: ConversationToneUpdate,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationResponse:
-    return await service.update_tone(conversation_id, payload)
+    return await service.update_tone(conversation_id, payload, current_user.id)
 
 
 @router.patch("/{conversation_id}/rag", response_model=ConversationResponse)
 async def update_rag(
     conversation_id: str,
     payload: ConversationRagUpdate,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationResponse:
-    return await service.update_rag(conversation_id, payload)
+    return await service.update_rag(conversation_id, payload, current_user.id)
 
 
 @router.post("/{conversation_id}/messages", response_model=ChatResponse)
@@ -65,23 +71,25 @@ async def send_message(
     conversation_id: str,
     payload: MessageCreate,
     stream: bool = Query(default=False),
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ):
     if stream:
         return StreamingResponse(
-            service.stream_message(conversation_id, payload),
+            service.stream_message(conversation_id, payload, current_user.id),
             media_type="text/event-stream",
         )
-    return await service.send_message(conversation_id, payload)
+    return await service.send_message(conversation_id, payload, current_user.id)
 
 
 @router.post("/{conversation_id}/suggest", response_model=SuggestResponse)
 async def suggest_reply(
     conversation_id: str,
     payload: SuggestRequest,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> SuggestResponse:
-    return await service.suggest_reply(conversation_id, payload)
+    return await service.suggest_reply(conversation_id, payload, current_user.id)
 
 
 @router.get("/{conversation_id}/messages", response_model=PaginatedMessages)
@@ -89,25 +97,28 @@ async def list_messages(
     conversation_id: str,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> PaginatedMessages:
-    return await service.list_messages(conversation_id, limit, offset)
+    return await service.list_messages(conversation_id, limit, offset, current_user.id)
 
 
 @router.delete("/{conversation_id}/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_message(
     conversation_id: str,
     message_id: str,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> Response:
-    await service.delete_message(conversation_id, message_id)
+    await service.delete_message(conversation_id, message_id, current_user.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(
     conversation_id: str,
+    current_user: User = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service),
 ) -> Response:
-    await service.archive(conversation_id)
+    await service.archive(conversation_id, current_user.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -3,8 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException
+
 from app.repositories.notes import NoteRepository
 from app.repositories.translations import TranslationRepository
+from app.schemas.note import NoteCreate, NoteUpdate
+from app.schemas.translation import TranslationCreate
+from app.services.rag import RagService
+from app.services.translations import TranslationService
 from app.tools.registry import Tool, ToolContext, ToolError
 
 
@@ -20,6 +26,30 @@ def _require_user(context: ToolContext) -> str:
     return context.user_id
 
 
+def _require_task(context: ToolContext) -> str:
+    if not context.task_id:
+        raise ToolError("no task_id available on the tool context")
+    return context.task_id
+
+
+def _require_rag(context: ToolContext) -> RagService:
+    session = _require_session(context)
+    if context.settings is None or context.embeddings is None or context.vectorstore is None:
+        raise ToolError("RAG services are not available on the tool context")
+    return RagService(session, context.settings, context.embeddings, context.vectorstore)
+
+
+def _require_translation_service(context: ToolContext) -> TranslationService:
+    session = _require_session(context)
+    if context.settings is None or context.llm is None:
+        raise ToolError("LLM services are not available on the tool context")
+    return TranslationService(session, context.settings, context.llm)
+
+
+def _tool_error_from_http(exc: HTTPException) -> ToolError:
+    return ToolError(str(exc.detail))
+
+
 async def _now(_: dict[str, Any], __: ToolContext) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     return {"iso": now.isoformat(), "epoch": int(now.timestamp())}
@@ -27,11 +57,16 @@ async def _now(_: dict[str, Any], __: ToolContext) -> dict[str, Any]:
 
 async def _list_notes(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     session = _require_session(context)
-    user_id = args.get("user_id") or _require_user(context)
+    user_id = _require_user(context)
     notes = await NoteRepository(session).list_for_user(user_id)
     limit = int(args.get("limit") or 20)
     items = [
-        {"id": n.id, "title": n.title, "style_name": n.style_name, "updated_at": n.updated_at.isoformat()}
+        {
+            "id": n.id,
+            "title": n.title,
+            "style_name": n.style_name,
+            "updated_at": n.updated_at.isoformat(),
+        }
         for n in notes[:limit]
     ]
     return {"count": len(items), "items": items}
@@ -43,7 +78,7 @@ async def _get_note(args: dict[str, Any], context: ToolContext) -> dict[str, Any
     if not note_id:
         raise ToolError("note_id is required")
     note = await NoteRepository(session).get(note_id)
-    if note is None:
+    if note is None or note.user_id != _require_user(context):
         raise ToolError(f"note '{note_id}' not found")
     return {
         "id": note.id,
@@ -57,22 +92,84 @@ async def _get_note(args: dict[str, Any], context: ToolContext) -> dict[str, Any
 async def _create_note(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     session = _require_session(context)
     user_id = _require_user(context)
-    content = args.get("content")
-    if not content:
+    try:
+        payload = NoteCreate.model_validate(
+            {
+                "user_id": user_id,
+                "title": args.get("title"),
+                "content": args.get("content") or "",
+                "style": {
+                    "style_name": args.get("style_name") or "default",
+                    "custom_instructions": args.get("custom_instructions"),
+                },
+            }
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if not payload.content:
         raise ToolError("content is required")
     note = await NoteRepository(session).create(
-        user_id=user_id,
-        title=args.get("title"),
-        content=content,
-        style_name=args.get("style_name") or "default",
-        custom_instructions=args.get("custom_instructions"),
+        user_id=payload.user_id,
+        title=payload.title,
+        content=payload.content,
+        style_name=payload.style.style_name,
+        custom_instructions=payload.style.custom_instructions,
     )
-    return {"id": note.id, "title": note.title}
+    return {
+        "id": note.id,
+        "title": note.title,
+        "style_name": note.style_name,
+        "updated_at": note.updated_at.isoformat(),
+    }
+
+
+async def _update_note(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    session = _require_session(context)
+    note_id = args.get("note_id")
+    if not note_id:
+        raise ToolError("note_id is required")
+    note = await NoteRepository(session).get(note_id)
+    if note is None or note.user_id != _require_user(context):
+        raise ToolError(f"note '{note_id}' not found")
+    style = None
+    if args.get("style_name") or args.get("custom_instructions"):
+        style = {
+            "style_name": args.get("style_name") or note.style_name,
+            "custom_instructions": args.get("custom_instructions"),
+        }
+    try:
+        payload = NoteUpdate.model_validate(
+            {
+                key: value
+                for key, value in {
+                    "title": args.get("title"),
+                    "content": args.get("content"),
+                    "style": style,
+                }.items()
+                if value is not None
+            }
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    updates = payload.model_dump(exclude_unset=True)
+    style_updates = updates.pop("style", None)
+    if style_updates is not None:
+        updates["style_name"] = style_updates["style_name"]
+        updates["custom_instructions"] = style_updates.get("custom_instructions")
+    if not updates:
+        raise ToolError("at least one update field is required")
+    updated = await NoteRepository(session).apply_updates(note, updates)
+    return {
+        "id": updated.id,
+        "title": updated.title,
+        "style_name": updated.style_name,
+        "updated_at": updated.updated_at.isoformat(),
+    }
 
 
 async def _list_translations(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     session = _require_session(context)
-    user_id = args.get("user_id") or _require_user(context)
+    user_id = _require_user(context)
     translations = await TranslationRepository(session).list_for_user(user_id)
     limit = int(args.get("limit") or 20)
     items = [
@@ -85,6 +182,112 @@ async def _list_translations(args: dict[str, Any], context: ToolContext) -> dict
         for t in translations[:limit]
     ]
     return {"count": len(items), "items": items}
+
+
+async def _translate_text(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    user_id = _require_user(context)
+    service = _require_translation_service(context)
+    try:
+        payload = TranslationCreate.model_validate(
+            {
+                "user_id": user_id,
+                "source_text": args.get("source_text"),
+                "target_language": args.get("target_language"),
+            }
+        )
+        result = await service.translate(payload)
+    except HTTPException as exc:
+        raise _tool_error_from_http(exc) from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    save = args.get("save")
+    if save is False:
+        row = await service.repo.get(result.translation_id)
+        if row is not None:
+            await service.repo.archive(row)
+            await service.session.commit()
+    return {
+        "translation_id": result.translation_id if save is not False else None,
+        "saved": save is not False,
+        "translated_text": result.translated_text,
+        "romanized_text": result.romanized_text,
+        "target_language": result.target_language,
+        "model": result.model,
+        "token_usage": result.token_usage,
+    }
+
+
+async def _ingest_task_document(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    task_id = _require_task(context)
+    rag = _require_rag(context)
+    filename = args.get("filename")
+    content = args.get("content")
+    if not filename:
+        raise ToolError("filename is required")
+    if not isinstance(content, str) or not content.strip():
+        raise ToolError("content is required")
+    try:
+        document = await rag.ingest_task_document(
+            task_id,
+            filename=filename,
+            content_type=args.get("content_type"),
+            data=content.encode("utf-8"),
+        )
+    except HTTPException as exc:
+        raise _tool_error_from_http(exc) from exc
+    return {
+        "id": document.id,
+        "filename": document.filename,
+        "content_type": document.content_type,
+        "size_bytes": document.size_bytes,
+        "chunk_count": document.chunk_count,
+        "created_at": document.created_at.isoformat(),
+    }
+
+
+async def _list_task_documents(_: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    task_id = _require_task(context)
+    rag = _require_rag(context)
+    try:
+        documents = await rag.list_task_documents(task_id)
+    except HTTPException as exc:
+        raise _tool_error_from_http(exc) from exc
+    return {
+        "count": len(documents),
+        "items": [
+            {
+                "id": document.id,
+                "filename": document.filename,
+                "content_type": document.content_type,
+                "size_bytes": document.size_bytes,
+                "chunk_count": document.chunk_count,
+                "created_at": document.created_at.isoformat(),
+            }
+            for document in documents
+        ],
+    }
+
+
+async def _search_task_documents(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    task_id = _require_task(context)
+    rag = _require_rag(context)
+    query = args.get("query")
+    if not query:
+        raise ToolError("query is required")
+    try:
+        token_budget = int(args.get("token_budget") or context.settings.rag_token_budget)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("token_budget must be an integer") from exc
+    try:
+        chunks = await rag.retrieve_task(task_id, query, token_budget=token_budget)
+    except HTTPException as exc:
+        raise _tool_error_from_http(exc) from exc
+    citations = rag.build_citations(chunks)
+    return {
+        "count": len(chunks),
+        "context": rag.format_context(chunks) if chunks else "",
+        "citations": [citation.model_dump() for citation in citations],
+    }
 
 
 async def _http_fetch(args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
@@ -121,11 +324,10 @@ def all_tools() -> list[Tool]:
         ),
         Tool(
             name="list_notes",
-            description="List markdown notes owned by a user (defaults to the task's user).",
+            description="List markdown notes owned by the task user.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "user_id": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "additionalProperties": False,
@@ -160,17 +362,88 @@ def all_tools() -> list[Tool]:
             handler=_create_note,
         ),
         Tool(
-            name="list_translations",
-            description="List saved translations for a user.",
+            name="update_note",
+            description="Update a markdown note owned by the task user.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "user_id": {"type": "string"},
+                    "note_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                    "style_name": {"type": "string"},
+                    "custom_instructions": {"type": "string"},
+                },
+                "required": ["note_id"],
+                "additionalProperties": False,
+            },
+            handler=_update_note,
+        ),
+        Tool(
+            name="list_translations",
+            description="List saved translations for the task user.",
+            parameters={
+                "type": "object",
+                "properties": {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "additionalProperties": False,
             },
             handler=_list_translations,
+        ),
+        Tool(
+            name="translate_text",
+            description="Translate text for the task user and save the translation by default.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source_text": {"type": "string"},
+                    "target_language": {"type": "string"},
+                    "save": {"type": "boolean"},
+                },
+                "required": ["source_text", "target_language"],
+                "additionalProperties": False,
+            },
+            handler=_translate_text,
+        ),
+        Tool(
+            name="ingest_task_document",
+            description=(
+                "Create a task-scoped RAG document from text or markdown content supplied in JSON."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "content": {"type": "string"},
+                    "content_type": {"type": "string"},
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": False,
+            },
+            handler=_ingest_task_document,
+        ),
+        Tool(
+            name="list_task_documents",
+            description="List RAG documents ingested for the current task.",
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=_list_task_documents,
+        ),
+        Tool(
+            name="search_task_documents",
+            description=(
+                "Search task-scoped RAG documents. Use this before answering questions that "
+                "depend on ingested document content."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "token_budget": {"type": "integer", "minimum": 1},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=_search_task_documents,
         ),
         Tool(
             name="http_fetch",

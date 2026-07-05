@@ -66,7 +66,7 @@ class FakeVectorStore:
             self.records[record.id] = record
 
     async def query(
-        self, embedding: list[float], *, conversation_id: str, top_k: int
+        self, embedding: list[float], *, scope_type: str, scope_id: str, top_k: int
     ) -> list[RetrievedChunk]:
         scored = [
             RetrievedChunk(
@@ -78,7 +78,7 @@ class FakeVectorStore:
                 page=record.page,
             )
             for record in self.records.values()
-            if record.conversation_id == conversation_id
+            if record.scope_type == scope_type and record.scope_id == scope_id
         ]
         scored.sort(key=lambda chunk: chunk.score, reverse=True)
         return scored[:top_k]
@@ -91,10 +91,13 @@ class FakeVectorStore:
         }
 
     async def delete_conversation(self, conversation_id: str) -> None:
+        await self.delete_scope("conversation", conversation_id)
+
+    async def delete_scope(self, scope_type: str, scope_id: str) -> None:
         self.records = {
             record_id: record
             for record_id, record in self.records.items()
-            if record.conversation_id != conversation_id
+            if not (record.scope_type == scope_type and record.scope_id == scope_id)
         }
 
     @staticmethod

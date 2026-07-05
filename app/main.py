@@ -6,6 +6,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import (
+    auth,
     conversations,
     documents,
     health,
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(tasks.router)
     app.include_router(tones.router)
     app.include_router(providers.router)
