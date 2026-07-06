@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { marked } from "marked";
 import { ApiError, apiFetch, apiJson, readSse, responseErrorMessage } from "@/lib/api";
 import type { ApiOptions } from "@/lib/api";
 import type {
@@ -187,6 +188,7 @@ export function CueApp() {
     { id: "meeting", label: "Meeting" },
     { id: "blog", label: "Blog" }
   ]);
+  const [notePreview, setNotePreview] = useState(false);
   const [regenPrompt, setRegenPrompt] = useState("");
   const [regenPending, setRegenPending] = useState(false);
 
@@ -214,6 +216,16 @@ export function CueApp() {
   const activeTranslation =
     translations.find((translation) => translation.id === activeTranslationId) || null;
   const lastMessageContent = activeConversation?.messages.at(-1)?.content;
+
+  const noteHtml = useMemo(() => {
+    if (!notePreview || !activeNote?.content) return "";
+    try {
+      const result = marked.parse(activeNote.content);
+      return typeof result === "string" ? result : "";
+    } catch {
+      return activeNote.content;
+    }
+  }, [activeNote?.content, notePreview]);
 
   const handleAuthFailure = useCallback(() => {
     store(AUTH_TOKEN_KEY, null);
@@ -325,6 +337,7 @@ export function CueApp() {
     setAuthError("");
     try {
       const data = await apiJson<TokenResponse>(`/auth/${mode}`, {
+        method: "POST",
         json: {
           email: String(form.get("email") || ""),
           password: String(form.get("password") || "")
@@ -770,7 +783,23 @@ export function CueApp() {
               <div className={styles.brandSub}>your AI prompt</div>
             </div>
             <button className={styles.iconButton} onClick={toggleTheme} title="Toggle dark theme">
-              {theme === "dark" ? "☀" : "☾"}
+              {theme === "dark" ? (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="5" />
+                  <line x1="12" y1="1" x2="12" y2="3" />
+                  <line x1="12" y1="21" x2="12" y2="23" />
+                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                  <line x1="1" y1="12" x2="3" y2="12" />
+                  <line x1="21" y1="12" x2="23" y2="12" />
+                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                </svg>
+              ) : (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                </svg>
+              )}
             </button>
           </div>
           <div className={styles.userRow}>
@@ -1092,6 +1121,13 @@ export function CueApp() {
                 </option>
               ))}
             </select>
+            <button
+              className={styles.smallButton}
+              onClick={() => setNotePreview((v) => !v)}
+              style={{ fontWeight: 600 }}
+            >
+              {notePreview ? "Edit" : "Preview"}
+            </button>
             <button className={styles.dangerButton} onClick={() => void deleteNote(activeNote.id)}>
               🗑
             </button>
@@ -1105,11 +1141,15 @@ export function CueApp() {
               placeholder="Untitled note"
               onChange={(event) => void saveNote(activeNote, { title: event.target.value })}
             />
-            <textarea
-              className={`${styles.textarea} ${styles.noteEditor}`}
-              value={activeNote.content}
-              onChange={(event) => void saveNote(activeNote, { content: event.target.value })}
-            />
+            {notePreview ? (
+              <div className={`${styles.textarea} ${styles.notePreview}`} dangerouslySetInnerHTML={{ __html: noteHtml }} />
+            ) : (
+              <textarea
+                className={`${styles.textarea} ${styles.noteEditor}`}
+                value={activeNote.content}
+                onChange={(event) => void saveNote(activeNote, { content: event.target.value })}
+              />
+            )}
             <div className={styles.row}>
               <select className={styles.select} defaultValue={activeNote.style_name}>
                 {noteStyles.map((style) => (
