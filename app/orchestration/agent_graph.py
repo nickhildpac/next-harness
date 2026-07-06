@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall
@@ -17,9 +19,11 @@ AGENT_SYSTEM_PREAMBLE = (
     "You are an autonomous task-completion agent. You break a goal down into small steps, "
     "call tools to gather information or take actions, and stop as soon as the goal is met. "
     "Reason briefly, call tools decisively, and call the 'finish' tool once the goal is met. "
-    "Use note tools when the user asks to save or organize notes, translation tools for "
-    "translation requests, and task document search before answering questions that depend on "
-    "ingested document content."
+    "If a user request matches an available tool, call that tool; do not claim you lack access "
+    "to it. Use list_notes when the user asks to list, show, or inspect notes. Use get_note "
+    "when note content is needed. Use note tools when the user asks to save or organize notes, "
+    "translation tools for translation requests, and task document search before answering "
+    "questions that depend on ingested document content."
 )
 
 
@@ -47,11 +51,15 @@ class AgentRun:
 
 class _AgentState(TypedDict, total=False):
     run: AgentRun
-    messages: list[ChatMessage]
+    messages: list[BaseMessage]
     turn: int
     params: GenerationParams
     context: "ToolContext"
     pending_calls: list[ToolCall]
+    retry_reason: bool
+    tool_refusal_retried: bool
+    required_tool_retried: bool
+    empty_response_retried: bool
 
 
 class AgentGraph:
@@ -68,7 +76,7 @@ class AgentGraph:
         graph.add_conditional_edges(
             "reason",
             self._route_after_reason,
-            {"act": "act", "end": END},
+            {"act": "act", "reason": "reason", "end": END},
         )
         graph.add_conditional_edges(
             "act",
@@ -87,10 +95,13 @@ class AgentGraph:
         context: ToolContext,
     ) -> AgentRun:
         run = AgentRun(goal=goal)
-        messages: list[ChatMessage] = [
-            ChatMessage(role="system", content=self.system_prompt()),
-            ChatMessage(role="user", content=f"Goal: {goal}"),
+        messages: list[BaseMessage] = [
+            SystemMessage(content=self.system_prompt()),
+            HumanMessage(content=f"Goal: {goal}"),
         ]
+        goal_hint = self._goal_tool_hint(goal, metadata=context.metadata)
+        if goal_hint:
+            messages.append(HumanMessage(content=goal_hint))
         state: _AgentState = {
             "run": run,
             "messages": messages,
@@ -98,6 +109,10 @@ class AgentGraph:
             "params": params,
             "context": context,
             "pending_calls": [],
+            "retry_reason": False,
+            "tool_refusal_retried": False,
+            "required_tool_retried": False,
+            "empty_response_retried": False,
         }
         try:
             final_state = await self.graph.ainvoke(state)
@@ -111,18 +126,57 @@ class AgentGraph:
     async def _reason(self, state: _AgentState) -> _AgentState:
         run = state["run"]
         params = state["params"]
+        state["retry_reason"] = False
         state["turn"] = state["turn"] + 1
         run.turns_used = state["turn"]
-        result = await self.llm.chat(state["messages"], params)
+        result = await self.llm.chat(self._to_port_messages(state["messages"]), params)
         run.model = result.model
         content = result.content or ""
         parsed = parse_tool_calls(content)
-        state["messages"].append(ChatMessage(role="assistant", content=content))
+        state["messages"].append(AIMessage(content=content))
         if parsed.thought:
             run.steps.append(StepRecord(kind="thought", content=parsed.thought))
 
         if not parsed.tool_calls:
-            summary = parsed.thought or content.strip() or "(no output)"
+            if self._should_retry_false_tool_refusal(content, state):
+                state["tool_refusal_retried"] = True
+                state["retry_reason"] = True
+                state["messages"].append(
+                    HumanMessage(
+                        content=(
+                            "Correction: you do have access to the listed tools. "
+                            "For this task, call the appropriate tool using a <tool_call> block. "
+                            f"Available tools: {', '.join(self.registry.names())}."
+                        )
+                    )
+                )
+                return state
+            required_tool_hint = self._required_tool_retry_hint(run.goal, state)
+            if required_tool_hint:
+                state["required_tool_retried"] = True
+                state["retry_reason"] = True
+                state["messages"].append(HumanMessage(content=required_tool_hint))
+                return state
+            if self._should_retry_empty_response(content, state):
+                state["empty_response_retried"] = True
+                state["retry_reason"] = True
+                state["messages"].append(
+                    HumanMessage(
+                        content=(
+                            "Correction: your previous response was empty. "
+                            "Either call the required tool using a <tool_call> block, "
+                            "or provide a non-empty final answer if the task is already complete."
+                        )
+                    )
+                )
+                return state
+            if not content.strip():
+                run.errored = True
+                run.error = "model returned an empty response without tool calls"
+                run.steps.append(StepRecord(kind="error", content=run.error))
+                state["pending_calls"] = []
+                return state
+            summary = parsed.thought or content.strip()
             run.final_summary = summary
             run.completed = True
             run.steps.append(StepRecord(kind="final", content=summary))
@@ -166,9 +220,7 @@ class AgentGraph:
         observation = "\n".join(
             format_tool_result(r.name, r.call_id, r.output, r.error) for r in tool_results
         )
-        state["messages"].append(
-            ChatMessage(role="user", content=f"Tool results:\n{observation}")
-        )
+        state["messages"].append(HumanMessage(content=f"Tool results:\n{observation}"))
         state["pending_calls"] = []
         return state
 
@@ -176,6 +228,8 @@ class AgentGraph:
         run = state["run"]
         if run.completed or run.errored:
             return "end"
+        if state.get("retry_reason") and state["turn"] < self.max_steps:
+            return "reason"
         if state.get("pending_calls"):
             return "act"
         return "end"
@@ -194,3 +248,97 @@ class AgentGraph:
             )
             return "end"
         return "reason"
+
+    def _should_retry_false_tool_refusal(self, content: str, state: _AgentState) -> bool:
+        if state.get("tool_refusal_retried") or state["turn"] >= self.max_steps:
+            return False
+        lowered = content.lower()
+        refusal_markers = (
+            "don't have a tool",
+            "do not have a tool",
+            "no tool",
+            "lack access",
+            "can't access",
+            "cannot access",
+        )
+        return bool(self.registry.names()) and any(marker in lowered for marker in refusal_markers)
+
+    def _should_retry_empty_response(self, content: str, state: _AgentState) -> bool:
+        if state.get("empty_response_retried") or state["turn"] >= self.max_steps:
+            return False
+        return not content.strip()
+
+    def _required_tool_retry_hint(self, goal: str, state: _AgentState) -> str | None:
+        if state.get("required_tool_retried") or state["turn"] >= self.max_steps:
+            return None
+        return self._goal_tool_hint(goal, retry=True, metadata=state["context"].metadata)
+
+    def _goal_tool_hint(
+        self, goal: str, *, retry: bool = False, metadata: dict | None = None
+    ) -> str | None:
+        lowered = goal.lower()
+        tool_names = set(self.registry.names())
+        uploaded_document_count = int((metadata or {}).get("uploaded_document_count") or 0)
+        if uploaded_document_count and {"list_task_documents", "search_task_documents"}.issubset(
+            tool_names
+        ):
+            prefix = (
+                "Correction: this task has uploaded documents. "
+                if retry
+                else "Tool-use plan for this uploaded-document task: "
+            )
+            return (
+                f"{prefix}First call list_task_documents to inspect the uploaded files. "
+                f'Then call search_task_documents with query "{goal}". '
+                "Use the returned excerpts to answer or summarize the document request. "
+                "Finally call finish. Do not answer without tool calls."
+            )
+
+        if "note" not in lowered:
+            return None
+        if not {"list_notes", "get_note", "create_note"}.issubset(tool_names):
+            return None
+
+        asks_for_summary = any(word in lowered for word in ("summarize", "summary", "summarise"))
+        asks_to_create = any(phrase in lowered for phrase in ("create", "new one", "new note", "save"))
+        asks_for_recent = any(word in lowered for word in ("last", "recent", "latest"))
+        if not (asks_for_summary and asks_to_create and asks_for_recent):
+            return None
+
+        limit = self._recent_note_limit(goal) or 2
+        prefix = (
+            "Correction: this task requires note tools. "
+            if retry
+            else "Tool-use plan for this notes task: "
+        )
+        return (
+            f"{prefix}First call list_notes with limit {limit}. "
+            "Then call get_note for each returned note id to read full content. "
+            "Then call create_note with a concise summary of those notes. "
+            "Finally call finish. Do not answer without tool calls."
+        )
+
+    def _recent_note_limit(self, goal: str) -> int | None:
+        match = re.search(r"\b(?:last|recent|latest)\s+(\d+)\s+notes?\b", goal, re.IGNORECASE)
+        if not match:
+            return None
+        return max(1, min(int(match.group(1)), 20))
+
+    def _to_port_messages(self, messages: list[BaseMessage]) -> list[ChatMessage]:
+        return [
+            ChatMessage(role=self._message_role(message), content=self._message_content(message))
+            for message in messages
+        ]
+
+    def _message_role(self, message: BaseMessage) -> str:
+        if isinstance(message, SystemMessage):
+            return "system"
+        if isinstance(message, AIMessage):
+            return "assistant"
+        return "user"
+
+    def _message_content(self, message: BaseMessage) -> str:
+        content = message.content
+        if isinstance(content, str):
+            return content
+        return str(content)

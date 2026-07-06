@@ -83,6 +83,22 @@ def test_openai_provider_used_when_key_configured():
     assert isinstance(client, OpenAIClient)
 
 
+def test_task_llm_client_uses_openai_even_when_default_is_openrouter():
+    from types import SimpleNamespace
+
+    from app.adapters.openai import OpenAIClient
+    from app.api.dependencies import get_task_llm_client
+    from app.core.config import Settings
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
+    client = get_task_llm_client(
+        request,
+        Settings(llm_provider="openrouter", openrouter_api_key="test-key", openai_api_key="test-key"),
+    )
+
+    assert isinstance(client, OpenAIClient)
+
+
 def test_anthropic_provider_used_when_key_configured():
     from app.adapters.anthropic import AnthropicClient
     from app.api.dependencies import build_llm_client

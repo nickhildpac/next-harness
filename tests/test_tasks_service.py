@@ -1,12 +1,13 @@
 from collections.abc import AsyncIterator
 
+import pytest
 from sqlalchemy import select
 
 from app.core.config import Settings
 from app.db.models import Document, Note, Translation, TranslationTurn
 from app.ports.llm import ChatMessage, GenerationParams, LLMResult
 from app.schemas.task import TaskCreate
-from app.services.tasks import TaskService
+from app.services.tasks import TaskDocumentUpload, TaskService
 from tests.conftest import FakeEmbeddings, FakeVectorStore
 
 
@@ -86,6 +87,24 @@ async def test_run_task_records_failure_on_step_limit(session):
     assert detail.error and "step limit" in detail.error
 
 
+async def test_run_task_records_failure_on_empty_model_response(session):
+    llm = ScriptedLLM(["", "", ""])
+    service = TaskService(session, Settings(), llm, http_client=None)
+
+    detail = await service.create_task(
+        TaskCreate(
+            goal="Summarize last 3 notes and save summary as a new role",
+            user_id="alice",
+            max_steps=5,
+        )
+    )
+
+    assert detail.status == "failed"
+    assert detail.result_summary is None
+    assert detail.error == "model returned an empty response without tool calls"
+    assert detail.steps[-1].kind == "error"
+
+
 async def test_scoping_allowed_tools_hides_others(session):
     llm = ScriptedLLM(
         [
@@ -103,6 +122,18 @@ async def test_scoping_allowed_tools_hides_others(session):
     system_prompt = llm.calls[0][0].content
     assert "list_notes" in system_prompt
     assert "http_fetch" not in system_prompt
+
+
+async def test_scoping_allowed_tools_rejects_unknown_names(session):
+    service = TaskService(session, Settings(), ScriptedLLM([]), http_client=None)
+
+    with pytest.raises(Exception) as exc_info:
+        await service.create_task(
+            TaskCreate(goal="List notes", user_id="alice", allowed_tools=["missing_tool"])
+        )
+
+    assert getattr(exc_info.value, "status_code", None) == 400
+    assert "missing_tool" in str(exc_info.value.detail)
 
 
 async def test_agent_can_create_note_for_task_user(session):
@@ -174,9 +205,56 @@ async def test_agent_can_ingest_and_search_task_documents(session):
     document = await session.scalar(select(Document).where(Document.task_id == detail.id))
     assert document is not None
     assert document.filename == "facts.md"
-    search_step = next(s for s in detail.steps if s.tool_name == "search_task_documents")
+    search_step = next(
+        s
+        for s in detail.steps
+        if s.kind == "tool_result" and s.tool_name == "search_task_documents"
+    )
     assert search_step.ok is True
     assert search_step.payload["output"]["count"] == 1
+    assert "Apples and bananas" in search_step.payload["output"]["context"]
+
+
+async def test_agent_can_search_preuploaded_task_documents(session):
+    llm = ScriptedLLM(
+        [
+            '<tool_call>{"name":"search_task_documents","arguments":{"query":"fruit salad apples"}}</tool_call>',
+            '<tool_call>{"name":"finish","arguments":{"summary":"uploaded document searched"}}</tool_call>',
+        ]
+    )
+    vectorstore = FakeVectorStore()
+    service = TaskService(
+        session,
+        Settings(),
+        llm,
+        http_client=None,
+        embeddings=FakeEmbeddings(),
+        vectorstore=vectorstore,
+    )
+
+    detail = await service.create_task(
+        TaskCreate(goal="Summarize the uploaded document", user_id="alice", max_steps=6),
+        documents=[
+            TaskDocumentUpload(
+                filename="facts.md",
+                content_type="text/markdown",
+                data=b"Apples and bananas are fruit salad ingredients.",
+            )
+        ],
+    )
+
+    assert detail.status == "completed"
+    document = await session.scalar(select(Document).where(Document.task_id == detail.id))
+    assert document is not None
+    assert document.filename == "facts.md"
+    first_prompt = "\n".join(message.content for message in llm.calls[0])
+    assert "uploaded-document task" in first_prompt
+    search_step = next(
+        s
+        for s in detail.steps
+        if s.kind == "tool_result" and s.tool_name == "search_task_documents"
+    )
+    assert search_step.ok is True
     assert "Apples and bananas" in search_step.payload["output"]["context"]
 
 
@@ -206,5 +284,6 @@ def test_openapi_exposes_task_routes():
 
     paths = app.openapi()["paths"]
     assert "/tasks" in paths
+    assert "/tasks/with-documents" in paths
     assert "/tasks/{task_id}" in paths
     assert "/tools" in paths

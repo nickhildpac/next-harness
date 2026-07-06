@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import httpx
 from fastapi import HTTPException, status
@@ -14,9 +15,17 @@ from app.ports.llm import GenerationParams, LLMClient
 from app.ports.vectorstore import VectorStore
 from app.repositories.tasks import TaskRepository
 from app.schemas.task import TaskCreate, TaskDetail, TaskResponse, TaskStepResponse, ToolInfo
+from app.services.rag import RagService
 from app.tools.registry import Tool, ToolContext, ToolRegistry, build_default_registry
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TaskDocumentUpload:
+    filename: str
+    content_type: str | None
+    data: bytes
 
 
 class TaskService:
@@ -44,7 +53,9 @@ class TaskService:
             for spec in self._registry.specs()
         ]
 
-    async def create_task(self, payload: TaskCreate) -> TaskDetail:
+    async def create_task(
+        self, payload: TaskCreate, documents: list[TaskDocumentUpload] | None = None
+    ) -> TaskDetail:
         registry = self._scoped_registry(payload.allowed_tools)
         task = await self.repo.create(
             user_id=payload.user_id,
@@ -52,6 +63,9 @@ class TaskService:
             max_steps=payload.max_steps,
             allowed_tools=payload.allowed_tools,
         )
+        uploaded_document_count = 0
+        if documents:
+            uploaded_document_count = await self._ingest_documents(task.id, documents)
         if not payload.run:
             await self.session.commit()
             return await self._detail(task.id)
@@ -71,6 +85,7 @@ class TaskService:
                 llm=self.llm,
                 embeddings=self.embeddings,
                 vectorstore=self.vectorstore,
+                metadata={"uploaded_document_count": uploaded_document_count},
             ),
         )
         await self._persist_run(task, run)
@@ -105,6 +120,12 @@ class TaskService:
         if not allowed:
             return self._registry
         allowed_set = set(allowed)
+        unknown = sorted(name for name in allowed_set if self._registry.get(name) is None)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"allowed_tools contains unknown tool(s): {', '.join(unknown)}",
+            )
         allowed_set.add("finish")  # finish is always reachable
         tools: list[Tool] = []
         for name in self._registry.names():
@@ -151,6 +172,26 @@ class TaskService:
             )
         else:
             await self.repo.set_status(task, TaskStatus.failed, error="run ended without a result", model=run.model)
+
+    async def _ingest_documents(
+        self, task_id: str, documents: list[TaskDocumentUpload]
+    ) -> int:
+        if self.embeddings is None or self.vectorstore is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document ingestion is unavailable.",
+            )
+        rag = RagService(self.session, self.settings, self.embeddings, self.vectorstore)
+        count = 0
+        for document in documents:
+            await rag.ingest_task_document(
+                task_id,
+                filename=document.filename,
+                content_type=document.content_type,
+                data=document.data,
+            )
+            count += 1
+        return count
 
     def _step_kind(self, step: StepRecord) -> TaskStepKind:
         return TaskStepKind(step.kind)

@@ -63,6 +63,16 @@ def get_llm_client(
     return build_llm_client(settings, provider, http_client=http_client)
 
 
+def get_task_llm_client(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> LLMClient:
+    # Agent tasks need reliable instruction following and tool-call markup. Keep them on the
+    # OpenAI adapter instead of inheriting the app-wide OpenRouter/default provider selection.
+    http_client = getattr(request.app.state, "http_client", None)
+    return OpenAIClient(settings, TokenCounter(), http_client)
+
+
 def build_llm_client(
     settings: Settings,
     provider: str | None = None,
@@ -180,7 +190,7 @@ async def get_task_service(
     request: Request,
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
-    llm: LLMClient = Depends(get_llm_client),
+    llm: LLMClient = Depends(get_task_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     vectorstore: VectorStore = Depends(get_vector_store),
 ) -> AsyncIterator[TaskService]:
