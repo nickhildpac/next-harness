@@ -1,0 +1,108 @@
+@import url("https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700&family=Work+Sans:wght@400;500;600;700&display=swap");
+
+:root {
+  --font-baloo: "Baloo 2";
+  --font-work: "Work Sans";
+  --surface-body: oklch(0.98 0.005 60);
+  --surface-panel: oklch(0.99 0.003 60);
+  --surface-sidebar: oklch(0.95 0.012 55);
+  --surface-card: white;
+  --surface-selected: oklch(0.91 0.03 55);
+  --surface-hover: oklch(0.93 0.02 55);
+  --border-soft: oklch(0.9 0.01 60);
+  --border-input: oklch(0.84 0.018 55);
+  --text-primary: oklch(0.25 0.01 60);
+  --text-body: oklch(0.31 0.01 60);
+  --text-label: oklch(0.42 0.015 55);
+  --text-subtle: oklch(0.5 0.015 55);
+  --text-secondary: oklch(0.56 0.015 55);
+  --disabled-bg: oklch(0.78 0.015 55);
+  --accent: oklch(0.7 0.15 45);
+  --accent-strong: oklch(0.65 0.16 45);
+  --ok: oklch(0.65 0.13 145);
+  --err: oklch(0.6 0.18 25);
+  --tint-ok: oklch(0.97 0.03 145);
+  --tint-err: oklch(0.97 0.03 25);
+  --tint-thought: oklch(0.96 0.015 250);
+  --result-bg: oklch(0.96 0.04 145);
+  --result-border: oklch(0.82 0.08 145);
+  --result-label: oklch(0.42 0.1 145);
+  --result-text: oklch(0.22 0.06 145);
+}
+
+:root[data-theme="dark"] {
+  --surface-body: oklch(0.17 0.008 60);
+  --surface-panel: oklch(0.2 0.008 60);
+  --surface-sidebar: oklch(0.22 0.012 55);
+  --surface-card: oklch(0.26 0.01 55);
+  --surface-selected: oklch(0.34 0.02 50);
+  --surface-hover: oklch(0.3 0.015 55);
+  --border-soft: oklch(0.3 0.012 55);
+  --border-input: oklch(0.38 0.015 55);
+  --text-primary: oklch(0.92 0.02 60);
+  --text-body: oklch(0.9 0.015 60);
+  --text-label: oklch(0.72 0.02 60);
+  --text-subtle: oklch(0.7 0.015 60);
+  --text-secondary: oklch(0.68 0.015 60);
+  --disabled-bg: oklch(0.32 0.015 55);
+  --tint-ok: oklch(0.26 0.04 145);
+  --tint-err: oklch(0.26 0.04 25);
+  --tint-thought: oklch(0.24 0.015 250);
+  --result-bg: oklch(0.25 0.05 145);
+  --result-border: oklch(0.38 0.08 145);
+  --result-label: oklch(0.72 0.12 145);
+  --result-text: oklch(0.88 0.06 145);
+}
+
+@keyframes blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--surface-body);
+  color: var(--text-body);
+  font-family: var(--font-work), sans-serif;
+}
+
+button,
+textarea,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--disabled-bg);
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

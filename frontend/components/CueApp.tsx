@@ -1,0 +1,1478 @@
+"use client";
+
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiError, apiFetch, apiJson, readSse, responseErrorMessage } from "@/lib/api";
+import type { ApiOptions } from "@/lib/api";
+import type {
+  Conversation,
+  DocumentInfo,
+  Language,
+  Message,
+  Note,
+  NoteStyle,
+  PaginatedMessages,
+  ProviderInfo,
+  Task,
+  TaskDetail,
+  ToolInfo,
+  ToneId,
+  ToneInfo,
+  TokenResponse,
+  Translation,
+  User
+} from "@/lib/types";
+import styles from "./CueApp.module.css";
+
+const AUTH_TOKEN_KEY = "cue-auth-token";
+const THEME_KEY = "cue-theme";
+const PROVIDER_DEFAULT_KEY = "cue-provider-default";
+const PROVIDER_CONV_PREFIX = "cue-provider-";
+const PROVIDER_NOTE_PREFIX = "cue-provider-note-";
+
+const fallbackTones: ToneInfo[] = [
+  { id: "friendly", label: "Friendly", color_key: "Friendly" },
+  { id: "professional", label: "Formal", color_key: "Formal" },
+  { id: "humorous", label: "Playful", color_key: "Playful" },
+  { id: "empathetic", label: "Empathetic", color_key: "Empathetic" },
+  { id: "concise", label: "Direct", color_key: "Direct" }
+];
+
+const toneColors: Record<string, string> = {
+  Friendly: "oklch(0.72 0.15 45)",
+  Formal: "oklch(0.65 0.1 250)",
+  Playful: "oklch(0.75 0.15 340)",
+  Empathetic: "oklch(0.7 0.12 150)",
+  Direct: "oklch(0.6 0.14 30)",
+  Technical: "oklch(0.58 0.11 250)",
+  Humorous: "oklch(0.75 0.15 340)"
+};
+
+const fallbackProviders: ProviderInfo[] = [
+  { id: "openrouter", label: "OpenRouter", available: true, model: "" },
+  { id: "openai", label: "OpenAI", available: false, model: "" },
+  { id: "anthropic", label: "Anthropic", available: false, model: "" },
+  { id: "gemini", label: "Gemini", available: false, model: "" },
+  { id: "ollama", label: "Ollama (local)", available: true, model: "" }
+];
+
+type Tab = "chats" | "notes" | "translate" | "tasks";
+type ConversationView = Conversation & {
+  messages: Message[];
+  loaded: boolean;
+  documents: DocumentInfo[];
+  docsLoaded: boolean;
+  docsLoading: boolean;
+  sendAs: string | null;
+};
+
+type StreamMessage = Partial<Message> & {
+  localId: string;
+  role: "user" | "assistant";
+  content: string;
+  streaming?: boolean;
+  error?: boolean;
+};
+
+function stored(key: string) {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function store(key: string, value: string | null) {
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore private browsing storage failures.
+  }
+}
+
+function toneLabel(tones: ToneInfo[], id?: string | null) {
+  return tones.find((tone) => tone.id === id)?.label || "Friendly";
+}
+
+function toneId(tones: ToneInfo[], label?: string | null): ToneId {
+  return (tones.find((tone) => tone.label === label)?.id || "friendly") as ToneId;
+}
+
+function toneColor(tones: ToneInfo[], labelOrId: string) {
+  const tone =
+    tones.find((item) => item.label === labelOrId) || tones.find((item) => item.id === labelOrId);
+  return toneColors[tone?.color_key || tone?.label || labelOrId] || toneColors.Friendly;
+}
+
+function participants(conversation: Conversation) {
+  if (conversation.kind !== "duo") return [];
+  return [
+    conversation.participant_user_id || conversation.user_id,
+    conversation.participant_second_user_id || conversation.second_user_id
+  ].filter(Boolean) as string[];
+}
+
+function normalizeConversation(conversation: Conversation): ConversationView {
+  const people = participants(conversation);
+  return {
+    ...conversation,
+    title: conversation.title || (people.length ? people.join(" & ") : "New conversation"),
+    messages: [],
+    loaded: false,
+    documents: [],
+    docsLoaded: false,
+    docsLoading: false,
+    sendAs: people[0] || null
+  };
+}
+
+function newestPreview(conversation: ConversationView) {
+  return conversation.messages.at(-1)?.content || "No messages yet";
+}
+
+function timeAgo(index: number) {
+  return ["2m ago", "1h ago", "Yesterday", "3d ago"][index] || "Earlier";
+}
+
+function defaultProvider(providers: ProviderInfo[]) {
+  const saved = stored(PROVIDER_DEFAULT_KEY);
+  return (
+    providers.find((provider) => provider.id === saved && provider.available !== false) ||
+    providers.find((provider) => provider.available !== false) ||
+    providers[0]
+  );
+}
+
+function providerForConversation(id: string, providers: ProviderInfo[]) {
+  return stored(PROVIDER_CONV_PREFIX + id) || defaultProvider(providers)?.id || "";
+}
+
+function providerForNote(id: string | null, providers: ProviderInfo[]) {
+  return (id && stored(PROVIDER_NOTE_PREFIX + id)) || defaultProvider(providers)?.id || "";
+}
+
+function providerLabel(provider: ProviderInfo) {
+  return `${provider.model ? `${provider.label} (${provider.model})` : provider.label}${
+    provider.available === false ? " - no key" : ""
+  }`;
+}
+
+export function CueApp() {
+  const [theme, setTheme] = useState("light");
+  const [token, setToken] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [authError, setAuthError] = useState("");
+  const [tab, setTab] = useState<Tab>("chats");
+  const [tones, setTones] = useState<ToneInfo[]>(fallbackTones);
+  const [providers, setProviders] = useState<ProviderInfo[]>(fallbackProviders);
+  const [llmAvailable, setLlmAvailable] = useState(true);
+  const [healthChecked, setHealthChecked] = useState(false);
+  const [conversations, setConversations] = useState<ConversationView[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [loadingConversations, setLoadingConversations] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [suggesting, setSuggesting] = useState(false);
+  const [uploadingDoc, setUploadingDoc] = useState(false);
+  const [lastSendText, setLastSendText] = useState("");
+  const [newModalOpen, setNewModalOpen] = useState(false);
+
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  const [noteStyles, setNoteStyles] = useState<NoteStyle[]>([
+    { id: "default", label: "Default" },
+    { id: "academic", label: "Academic" },
+    { id: "meeting", label: "Meeting" },
+    { id: "blog", label: "Blog" }
+  ]);
+  const [regenPrompt, setRegenPrompt] = useState("");
+  const [regenPending, setRegenPending] = useState(false);
+
+  const [translations, setTranslations] = useState<Translation[]>([]);
+  const [activeTranslationId, setActiveTranslationId] = useState<string | null>(null);
+  const [languages, setLanguages] = useState<Language[]>([]);
+  const [translateText, setTranslateText] = useState("");
+  const [translateLanguage, setTranslateLanguage] = useState("");
+  const [translatePending, setTranslatePending] = useState(false);
+
+  const [tools, setTools] = useState<ToolInfo[]>([]);
+  const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [activeTask, setActiveTask] = useState<TaskDetail | null>(null);
+  const [taskGoal, setTaskGoal] = useState("");
+  const [maxSteps, setMaxSteps] = useState(8);
+  const [taskRunning, setTaskRunning] = useState(false);
+
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  const activeConversation = conversations.find((conversation) => conversation.id === activeId) || null;
+  const activeNote = notes.find((note) => note.id === activeNoteId) || null;
+  const activeTranslation =
+    translations.find((translation) => translation.id === activeTranslationId) || null;
+  const lastMessageContent = activeConversation?.messages.at(-1)?.content;
+
+  const handleAuthFailure = useCallback(() => {
+    store(AUTH_TOKEN_KEY, null);
+    setToken(null);
+    setUser(null);
+    setConversations([]);
+    setActiveId(null);
+    setNotes([]);
+    setTranslations([]);
+    setTasks([]);
+  }, []);
+
+  const api = useCallback(
+    async <T,>(path: string, options: ApiOptions = {}) => {
+      try {
+        return await apiJson<T>(path, { ...options, token });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) handleAuthFailure();
+        throw error;
+      }
+    },
+    [handleAuthFailure, token]
+  );
+
+  const loadMessages = useCallback(
+    async (id: string) => {
+      setLoadingMessages(true);
+      try {
+        const data = await api<PaginatedMessages>(
+          `/conversations/${encodeURIComponent(id)}/messages?limit=200&offset=0`
+        );
+        setConversations((current) =>
+          current.map((conversation) =>
+            conversation.id === id
+              ? { ...conversation, messages: data.items, loaded: true }
+              : conversation
+          )
+        );
+      } finally {
+        setLoadingMessages(false);
+      }
+    },
+    [api]
+  );
+
+  const loadConversations = useCallback(async () => {
+    if (!token) return;
+    setLoadingConversations(true);
+    try {
+      const rows = await api<Conversation[]>("/conversations");
+      const mapped = rows.map(normalizeConversation);
+      setConversations(mapped);
+      const firstId = mapped[0]?.id || null;
+      setActiveId(firstId);
+      if (firstId) await loadMessages(firstId);
+    } finally {
+      setLoadingConversations(false);
+    }
+  }, [api, loadMessages, token]);
+
+  useEffect(() => {
+    const savedTheme =
+      stored(THEME_KEY) ||
+      (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    setTheme(savedTheme);
+    document.documentElement.setAttribute("data-theme", savedTheme);
+    setToken(stored(AUTH_TOKEN_KEY));
+  }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    Promise.all([
+      apiJson<ToneInfo[]>("/tones").then(setTones).catch(() => undefined),
+      apiJson<ProviderInfo[]>("/providers").then(setProviders).catch(() => undefined),
+      apiJson<NoteStyle[]>("/note-styles").then(setNoteStyles).catch(() => undefined),
+      apiJson<Language[]>("/languages").then((rows) => {
+        setLanguages(rows);
+        setTranslateLanguage((current) => current || rows[0]?.label || rows[0]?.id || "");
+      }).catch(() => undefined),
+      apiJson<{ available: boolean }>("/health/llm").then((data) => {
+        setLlmAvailable(data.available !== false);
+        setHealthChecked(true);
+      }).catch(() => {
+        setLlmAvailable(false);
+        setHealthChecked(true);
+      })
+    ]).catch(() => undefined);
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    apiJson<User>("/auth/me", { token })
+      .then((currentUser) => {
+        setUser(currentUser);
+        void loadConversations();
+      })
+      .catch((error) => {
+        if (error instanceof ApiError && error.status === 401) handleAuthFailure();
+      });
+  }, [handleAuthFailure, loadConversations, token]);
+
+  useEffect(() => {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+  }, [activeConversation?.messages.length, lastMessageContent]);
+
+  async function submitAuth(mode: "login" | "register", event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setAuthError("");
+    try {
+      const data = await apiJson<TokenResponse>(`/auth/${mode}`, {
+        json: {
+          email: String(form.get("email") || ""),
+          password: String(form.get("password") || "")
+        }
+      });
+      store(AUTH_TOKEN_KEY, data.access_token);
+      setToken(data.access_token);
+      setUser(data.user);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Authentication failed");
+    }
+  }
+
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    store(THEME_KEY, next);
+    document.documentElement.setAttribute("data-theme", next);
+  }
+
+  function logout() {
+    handleAuthFailure();
+  }
+
+  function updateConversation(id: string, updater: (conversation: ConversationView) => ConversationView) {
+    setConversations((current) =>
+      current.map((conversation) => (conversation.id === id ? updater(conversation) : conversation))
+    );
+  }
+
+  function pushMessage(id: string, message: Message | StreamMessage) {
+    updateConversation(id, (conversation) => ({
+      ...conversation,
+      messages: [...conversation.messages, message as Message]
+    }));
+  }
+
+  async function selectConversation(id: string) {
+    if (streamAbortRef.current) streamAbortRef.current.abort();
+    setActiveId(id);
+    setDraft("");
+    await loadMessages(id);
+  }
+
+  async function createConversation(payload: {
+    title?: string;
+    tone_name: string;
+    custom_persona?: string;
+    participants?: string[];
+    provider?: string;
+  }) {
+    const conversation = await api<Conversation>("/conversations", {
+      method: "POST",
+      json: {
+        title: payload.title || (payload.participants ? payload.participants.join(" & ") : "New conversation"),
+        tone: {
+          tone_name: payload.tone_name,
+          custom_persona: payload.custom_persona || undefined
+        },
+        participants: payload.participants
+      }
+    });
+    const mapped = normalizeConversation(conversation);
+    store(PROVIDER_CONV_PREFIX + mapped.id, payload.provider || defaultProvider(providers)?.id || null);
+    setConversations((current) => [mapped, ...current]);
+    setActiveId(mapped.id);
+    setNewModalOpen(false);
+  }
+
+  async function changeTone(label: string) {
+    if (!activeConversation) return;
+    const previous = activeConversation.tone_name;
+    updateConversation(activeConversation.id, (conversation) => ({
+      ...conversation,
+      tone_name: toneId(tones, label)
+    }));
+    try {
+      const data = await api<Conversation>(`/conversations/${activeConversation.id}/tone`, {
+        method: "PATCH",
+        json: { tone: toneId(tones, label) }
+      });
+      updateConversation(activeConversation.id, (conversation) => ({
+        ...conversation,
+        tone_name: data.tone_name
+      }));
+    } catch {
+      updateConversation(activeConversation.id, (conversation) => ({ ...conversation, tone_name: previous }));
+    }
+  }
+
+  async function deleteConversation(id: string) {
+    if (!window.confirm("Delete this conversation? This cannot be undone.")) return;
+    await api<void>(`/conversations/${id}`, { method: "DELETE" });
+    setConversations((current) => current.filter((conversation) => conversation.id !== id));
+    setActiveId((current) => (current === id ? conversations.find((item) => item.id !== id)?.id || null : current));
+  }
+
+  async function deleteMessage(messageId: string) {
+    if (!activeConversation) return;
+    await api<void>(`/conversations/${activeConversation.id}/messages/${messageId}`, { method: "DELETE" });
+    updateConversation(activeConversation.id, (conversation) => ({
+      ...conversation,
+      messages: conversation.messages.filter((message) => message.id !== messageId)
+    }));
+  }
+
+  async function sendMessage(textOverride?: string) {
+    const text = (textOverride || draft).trim();
+    if (!activeConversation || !text || streaming || suggesting) return;
+    if (activeConversation.kind === "duo") return sendDuoMessage(text);
+    if (!llmAvailable) return;
+
+    setLastSendText(text);
+    setDraft("");
+    setStreaming(true);
+    const userLocal: StreamMessage = {
+      localId: crypto.randomUUID(),
+      role: "user",
+      content: text,
+      user_id: user?.id || ""
+    };
+    const assistantLocal: StreamMessage = {
+      localId: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      streaming: true,
+      user_id: user?.id || ""
+    };
+    pushMessage(activeConversation.id, userLocal);
+    pushMessage(activeConversation.id, assistantLocal);
+
+    const abort = new AbortController();
+    streamAbortRef.current = abort;
+    try {
+      const headers = new Headers({ "Content-Type": "application/json" });
+      if (token) headers.set("Authorization", `Bearer ${token}`);
+      headers.set("X-LLM-Provider", providerForConversation(activeConversation.id, providers));
+      const response = await fetch(`/api/backend/conversations/${activeConversation.id}/messages?stream=true`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text, tone_override: { tone: activeConversation.tone_name } }),
+        signal: abort.signal
+      });
+      if (response.status === 401) handleAuthFailure();
+      if (!response.ok) throw new Error(await responseErrorMessage(response));
+      if (!response.body) throw new Error(`${response.status} ${response.statusText}`);
+      await readSse(response.body, (event) => {
+        if (event.data === "[DONE]") return;
+        const payload = JSON.parse(event.data) as Record<string, unknown>;
+        if (event.event === "error") throw new Error(String(payload.error || "Stream failed"));
+        updateConversation(activeConversation.id, (conversation) => ({
+          ...conversation,
+          messages: conversation.messages.map((message) => {
+            if ((message as StreamMessage).localId === userLocal.localId && payload.user_message_id) {
+              return { ...message, id: String(payload.user_message_id) };
+            }
+            if ((message as StreamMessage).localId !== assistantLocal.localId) return message;
+            if (event.event === "delta") {
+              return { ...message, content: `${message.content}${String(payload.delta || payload.content || "")}` };
+            }
+            if (event.event === "citations") {
+              return { ...message, citations: payload.citations as Message["citations"] };
+            }
+            if (event.event === "done") {
+              return {
+                ...message,
+                id: String(payload.assistant_message_id || message.id || ""),
+                streaming: false,
+                token_count: Number(payload.output_tokens || 0)
+              };
+            }
+            return message;
+          })
+        }));
+      });
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        setDraft(text);
+        updateConversation(activeConversation.id, (conversation) => ({
+          ...conversation,
+          messages: conversation.messages
+            .filter((message) => (message as StreamMessage).localId !== userLocal.localId)
+            .map((message) =>
+              (message as StreamMessage).localId === assistantLocal.localId
+                ? { ...message, content: `Send failed: ${(error as Error).message}`, streaming: false, error: true }
+                : message
+            )
+        }));
+      }
+    } finally {
+      setStreaming(false);
+      streamAbortRef.current = null;
+    }
+  }
+
+  async function sendDuoMessage(text: string) {
+    if (!activeConversation || !activeConversation.sendAs) return;
+    setDraft("");
+    setStreaming(true);
+    try {
+      const response = await api<{ user_message: Message }>(
+        `/conversations/${activeConversation.id}/messages`,
+        {
+          method: "POST",
+          json: { user_id: activeConversation.sendAs, content: text }
+        }
+      );
+      pushMessage(activeConversation.id, response.user_message);
+    } finally {
+      setStreaming(false);
+    }
+  }
+
+  async function suggestReply() {
+    if (!activeConversation?.sendAs || suggesting) return;
+    setSuggesting(true);
+    try {
+      const response = await api<{ message: Message | null; content: string }>(
+        `/conversations/${activeConversation.id}/suggest`,
+        {
+          method: "POST",
+          provider: providerForConversation(activeConversation.id, providers),
+          json: { for_user: activeConversation.sendAs, persist: true }
+        }
+      );
+      if (response.message) pushMessage(activeConversation.id, response.message);
+      else setDraft(response.content);
+    } finally {
+      setSuggesting(false);
+    }
+  }
+
+  async function toggleDocuments(next: boolean) {
+    if (!activeConversation) return;
+    updateConversation(activeConversation.id, (conversation) => ({ ...conversation, use_documents: next }));
+    await api<Conversation>(`/conversations/${activeConversation.id}/rag`, {
+      method: "PATCH",
+      json: { use_documents: next }
+    });
+    if (next) await loadDocuments(activeConversation.id);
+  }
+
+  async function loadDocuments(conversationId: string) {
+    const documents = await api<DocumentInfo[]>(`/conversations/${conversationId}/documents`);
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      documents,
+      docsLoaded: true,
+      docsLoading: false
+    }));
+  }
+
+  async function uploadDocument(file: File) {
+    if (!activeConversation) return;
+    setUploadingDoc(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await apiFetch(`/conversations/${activeConversation.id}/documents`, {
+        method: "POST",
+        token,
+        body: form
+      });
+      const document = (await response.json()) as DocumentInfo;
+      updateConversation(activeConversation.id, (conversation) => ({
+        ...conversation,
+        documents: [...conversation.documents, document],
+        docsLoaded: true
+      }));
+    } finally {
+      setUploadingDoc(false);
+    }
+  }
+
+  async function deleteDocument(documentId: string) {
+    if (!activeConversation) return;
+    await api<void>(`/conversations/${activeConversation.id}/documents/${documentId}`, {
+      method: "DELETE"
+    });
+    updateConversation(activeConversation.id, (conversation) => ({
+      ...conversation,
+      documents: conversation.documents.filter((document) => document.id !== documentId)
+    }));
+  }
+
+  async function loadNotes() {
+    const rows = await api<Note[]>("/notes");
+    setNotes(rows);
+    setActiveNoteId((current) => (current && rows.some((note) => note.id === current) ? current : rows[0]?.id || null));
+  }
+
+  async function createNote() {
+    const note = await api<Note>("/notes", {
+      method: "POST",
+      json: { title: "Untitled note", content: "", style: { style_name: "default" } }
+    });
+    setNotes((current) => [note, ...current]);
+    setActiveNoteId(note.id);
+  }
+
+  async function saveNote(note: Note, patch: Partial<Pick<Note, "title" | "content">>) {
+    setNotes((current) => current.map((item) => (item.id === note.id ? { ...item, ...patch } : item)));
+    const updated = await api<Note>(`/notes/${note.id}`, { method: "PATCH", json: patch });
+    setNotes((current) => current.map((item) => (item.id === note.id ? updated : item)));
+  }
+
+  async function deleteNote(id: string) {
+    await api<void>(`/notes/${id}`, { method: "DELETE" });
+    setNotes((current) => current.filter((note) => note.id !== id));
+    setActiveNoteId((current) => (current === id ? notes.find((note) => note.id !== id)?.id || null : current));
+  }
+
+  async function regenerateNote() {
+    if (!activeNote || !regenPrompt.trim()) return;
+    setRegenPending(true);
+    try {
+      const data = await api<{ content: string }>(`/notes/${activeNote.id}/regenerate`, {
+        method: "POST",
+        provider: providerForNote(activeNote.id, providers),
+        json: { prompt: regenPrompt }
+      });
+      setNotes((current) =>
+        current.map((note) => (note.id === activeNote.id ? { ...note, content: data.content } : note))
+      );
+      setRegenPrompt("");
+    } finally {
+      setRegenPending(false);
+    }
+  }
+
+  async function loadTranslations() {
+    const rows = await api<Translation[]>("/translations");
+    setTranslations(rows);
+    setActiveTranslationId((current) =>
+      current && rows.some((translation) => translation.id === current) ? current : rows[0]?.id || null
+    );
+  }
+
+  async function runTranslation() {
+    if (!translateText.trim() || !translateLanguage) return;
+    setTranslatePending(true);
+    try {
+      const data = await api<{
+        translation_id: string;
+        translated_text: string;
+        romanized_text: string;
+        model: string;
+      }>("/translations", {
+        method: "POST",
+        provider: defaultProvider(providers)?.id || null,
+        json: { source_text: translateText, target_language: translateLanguage }
+      });
+      const now = new Date().toISOString();
+      const row: Translation = {
+        id: data.translation_id,
+        user_id: user?.id || "",
+        title: translateText.slice(0, 50),
+        source_text: translateText,
+        target_language: translateLanguage,
+        translated_text: data.translated_text,
+        romanized_text: data.romanized_text,
+        model: data.model,
+        is_archived: false,
+        created_at: now,
+        updated_at: now
+      };
+      setTranslations((current) => [row, ...current]);
+      setActiveTranslationId(row.id);
+      setTranslateText("");
+    } finally {
+      setTranslatePending(false);
+    }
+  }
+
+  async function deleteTranslation(id: string) {
+    await api<void>(`/translations/${id}`, { method: "DELETE" });
+    setTranslations((current) => current.filter((translation) => translation.id !== id));
+    setActiveTranslationId((current) =>
+      current === id ? translations.find((translation) => translation.id !== id)?.id || null : current
+    );
+  }
+
+  async function loadTasks() {
+    const [toolRows, taskRows] = await Promise.all([api<ToolInfo[]>("/tools"), api<Task[]>("/tasks")]);
+    setTools(toolRows);
+    setSelectedTools((current) => (current.size ? current : new Set(toolRows.map((tool) => tool.name))));
+    setTasks(taskRows);
+  }
+
+  async function selectTask(id: string) {
+    setActiveTaskId(id);
+    const task = await api<TaskDetail>(`/tasks/${id}`);
+    setActiveTask(task);
+  }
+
+  async function runTask() {
+    if (!taskGoal.trim()) return;
+    setTaskRunning(true);
+    try {
+      const allowed = Array.from(selectedTools);
+      const task = await api<TaskDetail>("/tasks", {
+        method: "POST",
+        json: {
+          goal: taskGoal,
+          max_steps: maxSteps,
+          allowed_tools: allowed.length === tools.length ? null : allowed
+        }
+      });
+      setTaskGoal("");
+      setActiveTaskId(task.id);
+      setActiveTask(task);
+      await loadTasks();
+    } finally {
+      setTaskRunning(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!user) return;
+    if (tab === "notes" && !notes.length) void loadNotes();
+    if (tab === "translate" && !translations.length) void loadTranslations();
+    if (tab === "tasks" && !tasks.length) void loadTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, user]);
+
+  useEffect(() => {
+    if (activeConversation?.use_documents && !activeConversation.docsLoaded && !activeConversation.docsLoading) {
+      void loadDocuments(activeConversation.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversation?.id, activeConversation?.use_documents]);
+
+  const newButtonLabel = tab === "notes" ? "New note" : tab === "translate" ? "New translation" : tab === "tasks" ? "New task" : "New conversation";
+
+  return (
+    <div className={styles.app}>
+      <aside className={styles.sidebar}>
+        <div className={styles.sidebarTop}>
+          <div className={styles.brandRow}>
+            <div className={styles.brandMark}>›</div>
+            <div className={styles.brandText}>
+              <div className={styles.brandName}>Cue</div>
+              <div className={styles.brandSub}>your AI prompt</div>
+            </div>
+            <button className={styles.iconButton} onClick={toggleTheme} title="Toggle dark theme">
+              {theme === "dark" ? "☀" : "☾"}
+            </button>
+          </div>
+          <div className={styles.userRow}>
+            <span className={styles.userLabel}>{user ? user.email : "Signed out"}</span>
+            {user ? (
+              <button className={styles.smallButton} onClick={logout}>
+                Logout
+              </button>
+            ) : null}
+          </div>
+          <div className={styles.tabBar}>
+            {(["chats", "notes", "translate", "tasks"] as Tab[]).map((item) => (
+              <button
+                key={item}
+                className={`${styles.tabButton} ${tab === item ? styles.tabButtonActive : ""}`}
+                onClick={() => setTab(item)}
+              >
+                {item === "chats" ? "Chats" : item === "translate" ? "Translate" : item[0].toUpperCase() + item.slice(1)}
+              </button>
+            ))}
+          </div>
+          <button
+            className={styles.newButton}
+            onClick={() => {
+              if (tab === "notes") void createNote();
+              else if (tab === "translate") {
+                setActiveTranslationId(null);
+                setTranslateText("");
+              } else if (tab === "tasks") {
+                setActiveTaskId(null);
+                setActiveTask(null);
+              } else setNewModalOpen(true);
+            }}
+          >
+            <span>+</span>
+            <span>{newButtonLabel}</span>
+          </button>
+        </div>
+        {renderSidebar()}
+      </aside>
+      <main className={styles.main}>{renderMain()}</main>
+      {!user ? <AuthOverlay onSubmit={submitAuth} error={authError} /> : null}
+      {newModalOpen ? (
+        <NewConversationModal
+          tones={tones}
+          providers={providers}
+          onClose={() => setNewModalOpen(false)}
+          onCreate={createConversation}
+        />
+      ) : null}
+    </div>
+  );
+
+  function renderSidebar() {
+    if (!user) return <div className={styles.sidebarList} />;
+    if (tab === "notes") {
+      return (
+        <div className={styles.sidebarList}>
+          {notes.map((note) => (
+            <button
+              key={note.id}
+              className={`${styles.listItem} ${activeNoteId === note.id ? styles.listItemActive : ""}`}
+              onClick={() => setActiveNoteId(note.id)}
+            >
+              <span className={styles.listTitle}>{note.title || "Untitled note"}</span>
+              <span className={styles.preview}>{note.content || "Empty note"}</span>
+            </button>
+          ))}
+        </div>
+      );
+    }
+    if (tab === "translate") {
+      return (
+        <div className={styles.sidebarList}>
+          {translations.map((translation) => (
+            <button
+              key={translation.id}
+              className={`${styles.listItem} ${activeTranslationId === translation.id ? styles.listItemActive : ""}`}
+              onClick={() => setActiveTranslationId(translation.id)}
+            >
+              <span className={styles.listTitle}>{translation.title || translation.target_language}</span>
+              <span className={styles.preview}>{translation.translated_text}</span>
+            </button>
+          ))}
+        </div>
+      );
+    }
+    if (tab === "tasks") {
+      return (
+        <div className={styles.sidebarList}>
+          {tasks.map((task) => (
+            <button
+              key={task.id}
+              className={`${styles.listItem} ${activeTaskId === task.id ? styles.listItemActive : ""}`}
+              onClick={() => void selectTask(task.id)}
+            >
+              <span className={styles.listTitle}>{task.goal}</span>
+              <span className={styles.preview}>{task.status}</span>
+            </button>
+          ))}
+        </div>
+      );
+    }
+    return (
+      <div className={styles.sidebarList}>
+        {loadingConversations ? <div className={styles.empty}>Loading conversations...</div> : null}
+        {conversations.map((conversation, index) => (
+          <button
+            key={conversation.id}
+            className={`${styles.listItem} ${conversation.id === activeId ? styles.listItemActive : ""}`}
+            onClick={() => void selectConversation(conversation.id)}
+          >
+            <div className={styles.listTitleRow}>
+              <div className={styles.listTitle}>
+                {conversation.kind === "duo" ? "👥 " : ""}
+                {conversation.title}
+              </div>
+              <span
+                className={styles.toneDot}
+                style={{ background: toneColor(tones, toneLabel(tones, conversation.tone_name)) }}
+              />
+            </div>
+            <div className={styles.preview}>{newestPreview(conversation)}</div>
+            <div className={styles.meta}>{timeAgo(index)}</div>
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  function renderMain() {
+    if (!user) return <div />;
+    if (tab === "notes") return renderNotes();
+    if (tab === "translate") return renderTranslations();
+    if (tab === "tasks") return renderTasks();
+    return renderChat();
+  }
+
+  function renderChat() {
+    if (!activeConversation) return <div className={styles.empty}>Create a conversation to begin.</div>;
+    const isDuo = activeConversation.kind === "duo";
+    const people = participants(activeConversation);
+    const composerLocked = streaming || suggesting || (!isDuo && !llmAvailable);
+    const sendDisabled = !draft.trim() || composerLocked;
+
+    return (
+      <>
+        <div className={styles.header}>
+          <div className={styles.headerTitle}>
+            <div className={styles.title}>
+              {isDuo ? "👥 " : ""}
+              {activeConversation.title}
+            </div>
+            <div className={styles.subtitle}>
+              {isDuo ? `${people.join(" & ")} · ` : ""}
+              {activeConversation.messages.length} messages
+            </div>
+          </div>
+          <div className={styles.controls}>
+            {isDuo ? (
+              <>
+                <span className={styles.label}>Acting as</span>
+                <select
+                  className={styles.select}
+                  value={activeConversation.sendAs || ""}
+                  onChange={(event) =>
+                    updateConversation(activeConversation.id, (conversation) => ({
+                      ...conversation,
+                      sendAs: event.target.value
+                    }))
+                  }
+                >
+                  {people.map((person) => (
+                    <option key={person} value={person}>
+                      {person}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : (
+              <label className={styles.label}>
+                <input
+                  type="checkbox"
+                  checked={activeConversation.use_documents}
+                  onChange={(event) => void toggleDocuments(event.target.checked)}
+                />{" "}
+                Docs
+              </label>
+            )}
+            <span className={styles.label}>Tone</span>
+            <select
+              className={styles.select}
+              value={toneLabel(tones, activeConversation.tone_name)}
+              onChange={(event) => void changeTone(event.target.value)}
+            >
+              {tones.map((tone) => (
+                <option key={tone.id} value={tone.label}>
+                  {tone.label}
+                </option>
+              ))}
+            </select>
+            <span className={styles.label}>Model</span>
+            <ProviderSelect
+              providers={providers}
+              value={providerForConversation(activeConversation.id, providers)}
+              onChange={(value) => {
+                store(PROVIDER_CONV_PREFIX + activeConversation.id, value);
+                store(PROVIDER_DEFAULT_KEY, value);
+              }}
+            />
+            <button
+              className={styles.dangerButton}
+              title="Delete conversation"
+              onClick={() => void deleteConversation(activeConversation.id)}
+            >
+              🗑
+            </button>
+          </div>
+        </div>
+        {activeConversation.use_documents ? (
+          <div className={styles.documentsBar}>
+            <label className={styles.ghostButton}>
+              {uploadingDoc ? "Uploading..." : "📎 Upload document"}
+              <input
+                hidden
+                type="file"
+                accept=".pdf,.txt,.md"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void uploadDocument(file);
+                }}
+              />
+            </label>
+            {activeConversation.documents.map((document) => (
+              <span className={styles.chip} key={document.id}>
+                📄 {document.filename}
+                <button className={styles.deleteInline} onClick={() => void deleteDocument(document.id)}>
+                  x
+                </button>
+              </span>
+            ))}
+            {activeConversation.docsLoaded && !activeConversation.documents.length ? (
+              <span className={styles.preview}>No documents yet - upload a .pdf, .txt, or .md to ground replies</span>
+            ) : null}
+          </div>
+        ) : null}
+        {healthChecked && !llmAvailable && !isDuo ? <div className={styles.statusBar}>connecting...</div> : null}
+        <div className={styles.messages} ref={messagesRef}>
+          {loadingMessages ? <div className={styles.empty}>Loading conversation...</div> : null}
+          {activeConversation.messages.map((message) => (
+            <MessageBubble
+              key={message.id || (message as StreamMessage).localId}
+              message={message}
+              mine={isDuo ? message.user_id === activeConversation.sendAs : message.role === "user"}
+              isDuo={isDuo}
+              onDelete={message.id ? () => void deleteMessage(message.id) : undefined}
+            />
+          ))}
+        </div>
+        <div className={styles.composerWrap}>
+          <div className={styles.composer}>
+            <textarea
+              className={styles.draft}
+              rows={3}
+              placeholder={isDuo ? `Message as ${activeConversation.sendAs || ""}...` : "Message the assistant..."}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
+            />
+            {isDuo ? (
+              <button className={styles.suggestButton} disabled={suggesting || streaming} onClick={() => void suggestReply()}>
+                ✨
+              </button>
+            ) : null}
+            <button className={styles.sendButton} disabled={sendDisabled} onClick={() => void sendMessage()}>
+              ↑
+            </button>
+          </div>
+          <div className={styles.hint}>
+            {suggesting
+              ? `Drafting a reply for ${activeConversation.sendAs || ""}...`
+              : streaming
+                ? "Assistant is responding..."
+                : isDuo
+                  ? `Enter to send as ${activeConversation.sendAs || ""} · AI drafts their reply with ✨`
+                  : "Enter to send · Shift+Enter for new line"}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  function renderNotes() {
+    if (!activeNote) return <div className={styles.empty}>Create a note to begin.</div>;
+    return (
+      <>
+        <div className={styles.header}>
+          <div className={styles.headerTitle}>
+            <div className={styles.title}>{activeNote.title || "Untitled note"}</div>
+            <div className={styles.subtitle}>{activeNote.style_name}</div>
+          </div>
+          <div className={styles.controls}>
+            <select
+              className={styles.select}
+              value={providerForNote(activeNote.id, providers)}
+              onChange={(event) => {
+                store(PROVIDER_NOTE_PREFIX + activeNote.id, event.target.value);
+                store(PROVIDER_DEFAULT_KEY, event.target.value);
+              }}
+            >
+              {providers.map((provider) => (
+                <option key={provider.id} value={provider.id} disabled={provider.available === false}>
+                  {providerLabel(provider)}
+                </option>
+              ))}
+            </select>
+            <button className={styles.dangerButton} onClick={() => void deleteNote(activeNote.id)}>
+              🗑
+            </button>
+          </div>
+        </div>
+        <div className={styles.panel}>
+          <div className={styles.formStack}>
+            <input
+              className={styles.input}
+              value={activeNote.title || ""}
+              placeholder="Untitled note"
+              onChange={(event) => void saveNote(activeNote, { title: event.target.value })}
+            />
+            <textarea
+              className={`${styles.textarea} ${styles.noteEditor}`}
+              value={activeNote.content}
+              onChange={(event) => void saveNote(activeNote, { content: event.target.value })}
+            />
+            <div className={styles.row}>
+              <select className={styles.select} defaultValue={activeNote.style_name}>
+                {noteStyles.map((style) => (
+                  <option key={style.id} value={style.id}>
+                    {style.label}
+                  </option>
+                ))}
+              </select>
+              <input
+                className={styles.input}
+                value={regenPrompt}
+                onChange={(event) => setRegenPrompt(event.target.value)}
+                placeholder="Regenerate instruction"
+                style={{ flex: 1 }}
+              />
+              <button className={styles.primaryButton} disabled={regenPending} onClick={() => void regenerateNote()}>
+                Regenerate
+              </button>
+            </div>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  function renderTranslations() {
+    return (
+      <>
+        <div className={styles.header}>
+          <div className={styles.headerTitle}>
+            <div className={styles.title}>Translate</div>
+            <div className={styles.subtitle}>{translations.length} saved translations</div>
+          </div>
+          {activeTranslation ? (
+            <button className={styles.dangerButton} onClick={() => void deleteTranslation(activeTranslation.id)}>
+              🗑
+            </button>
+          ) : null}
+        </div>
+        <div className={styles.panel}>
+          <div className={styles.formStack}>
+            <select
+              className={styles.select}
+              value={translateLanguage}
+              onChange={(event) => setTranslateLanguage(event.target.value)}
+            >
+              {languages.map((language) => (
+                <option key={language.id} value={language.label}>
+                  {language.label}
+                </option>
+              ))}
+            </select>
+            <textarea
+              className={styles.textarea}
+              rows={6}
+              placeholder="Text to translate"
+              value={translateText}
+              onChange={(event) => setTranslateText(event.target.value)}
+            />
+            <button className={styles.primaryButton} disabled={translatePending} onClick={() => void runTranslation()}>
+              Translate
+            </button>
+            {activeTranslation ? (
+              <div className={styles.card}>
+                <h3>{activeTranslation.target_language}</h3>
+                <p>{activeTranslation.translated_text}</p>
+                <p className={styles.preview}>{activeTranslation.romanized_text}</p>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  function renderTasks() {
+    return (
+      <>
+        <div className={styles.header}>
+          <div className={styles.headerTitle}>
+            <div className={styles.title}>Cue Task Console</div>
+            <div className={styles.subtitle}>agentic tool-use surface</div>
+          </div>
+        </div>
+        <div className={styles.panel}>
+          <div className={styles.formStack}>
+            <textarea
+              className={styles.textarea}
+              rows={4}
+              placeholder="e.g. Summarize my last 3 notes and save the summary as a new note."
+              value={taskGoal}
+              onChange={(event) => setTaskGoal(event.target.value)}
+            />
+            <div className={styles.row}>
+              <input
+                className={styles.input}
+                type="number"
+                min={1}
+                max={32}
+                value={maxSteps}
+                onChange={(event) => setMaxSteps(Number(event.target.value) || 8)}
+              />
+              <button className={styles.primaryButton} disabled={taskRunning} onClick={() => void runTask()}>
+                Run task
+              </button>
+            </div>
+            <div className={styles.row} style={{ flexWrap: "wrap" }}>
+              {tools.map((tool) => (
+                <button
+                  key={tool.name}
+                  className={styles.chip}
+                  onClick={() =>
+                    setSelectedTools((current) => {
+                      const next = new Set(current);
+                      if (next.has(tool.name)) next.delete(tool.name);
+                      else next.add(tool.name);
+                      return next;
+                    })
+                  }
+                  style={{
+                    borderColor: selectedTools.has(tool.name) ? "var(--accent)" : "var(--border-input)"
+                  }}
+                >
+                  {tool.name}
+                </button>
+              ))}
+            </div>
+            {activeTask ? (
+              <div className={styles.formStack}>
+                <div className={styles.card}>
+                  <strong>{activeTask.status}</strong>
+                  <p>{activeTask.result_summary || activeTask.error || activeTask.goal}</p>
+                </div>
+                {activeTask.steps.map((step) => (
+                  <div
+                    key={step.id}
+                    className={`${styles.taskStep} ${
+                      step.kind === "final" ? styles.taskStepFinal : step.kind === "error" || step.ok === false ? styles.taskStepError : ""
+                    }`}
+                  >
+                    <strong>{step.tool_name ? `${step.kind} · ${step.tool_name}` : step.kind}</strong>
+                    {step.content ? <p>{step.content}</p> : null}
+                    {step.payload ? <pre className={styles.pre}>{JSON.stringify(step.payload, null, 2)}</pre> : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className={styles.empty}>Enter a goal and press Run task, or select a past task.</div>
+            )}
+          </div>
+        </div>
+      </>
+    );
+  }
+}
+
+function AuthOverlay({
+  onSubmit,
+  error
+}: {
+  onSubmit: (mode: "login" | "register", event: FormEvent<HTMLFormElement>) => void;
+  error: string;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const modeRef = useRef(mode);
+  return (
+    <div className={styles.modal}>
+      <form className={styles.authCard} onSubmit={(event) => onSubmit(modeRef.current, event)}>
+        <div className={styles.brandName}>Cue</div>
+        <div className={styles.preview}>{error}</div>
+        <input className={styles.input} name="email" type="email" autoComplete="email" placeholder="Email" required />
+        <input
+          className={styles.input}
+          name="password"
+          type="password"
+          autoComplete={mode === "login" ? "current-password" : "new-password"}
+          placeholder="Password"
+          required
+        />
+        <div className={styles.split}>
+          <button className={styles.primaryButton} type="submit" onClick={() => { setMode("login"); modeRef.current = "login"; }}>
+            Login
+          </button>
+          <button className={styles.ghostButton} type="submit" onClick={() => { setMode("register"); modeRef.current = "register"; }}>
+            Register
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ProviderSelect({
+  providers,
+  value,
+  onChange
+}: {
+  providers: ProviderInfo[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const selected = value || defaultProvider(providers)?.id || "";
+  return (
+    <select className={styles.select} value={selected} onChange={(event) => onChange(event.target.value)}>
+      {providers.map((provider) => (
+        <option key={provider.id} value={provider.id} disabled={provider.available === false}>
+          {providerLabel(provider)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function MessageBubble({
+  message,
+  mine,
+  isDuo,
+  onDelete
+}: {
+  message: Message | StreamMessage;
+  mine: boolean;
+  isDuo: boolean;
+  onDelete?: () => void;
+}) {
+  const sender = isDuo && message.user_id ? `${message.user_id}${message.model ? " · AI draft" : ""}` : message.role === "user" ? "You" : "Assistant";
+  return (
+    <div className={`${styles.messageRow} ${mine ? styles.messageMine : styles.messageOther}`}>
+      {mine && onDelete ? (
+        <button className={styles.deleteInline} onClick={onDelete}>
+          x
+        </button>
+      ) : null}
+      <div className={`${styles.messageStack} ${mine ? styles.messageStackMine : styles.messageStackOther}`}>
+        <div className={styles.sender}>{sender}</div>
+        <div className={`${styles.bubble} ${mine ? styles.bubbleMine : ""}`}>
+          {message.content}
+          {(message as StreamMessage).streaming ? <span className={styles.cursor} /> : null}
+        </div>
+        {!mine && message.citations?.length ? (
+          <div className={styles.sources}>
+            Sources:
+            {message.citations.map((citation) => (
+              <span key={`${citation.document_id}-${citation.marker}`} title={citation.snippet}>
+                [{citation.marker}] {citation.filename}
+                {citation.page ? ` p.${citation.page}` : ""}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+      {!mine && onDelete ? (
+        <button className={styles.deleteInline} onClick={onDelete}>
+          x
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function NewConversationModal({
+  tones,
+  providers,
+  onClose,
+  onCreate
+}: {
+  tones: ToneInfo[];
+  providers: ProviderInfo[];
+  onClose: () => void;
+  onCreate: (payload: {
+    title?: string;
+    tone_name: string;
+    custom_persona?: string;
+    participants?: string[];
+    provider?: string;
+  }) => Promise<void>;
+}) {
+  const [kind, setKind] = useState("assistant");
+  const [tone, setTone] = useState<ToneId>("friendly");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const first = String(form.get("first") || "").trim();
+    const second = String(form.get("second") || "").trim();
+    if (kind === "duo" && (!first || !second || first === second)) return;
+    setBusy(true);
+    try {
+      await onCreate({
+        title: String(form.get("title") || "").trim() || undefined,
+        tone_name: tone,
+        custom_persona: tone === "custom" ? String(form.get("persona") || "").trim() || undefined : undefined,
+        participants: kind === "duo" ? [first, second] : undefined,
+        provider: String(form.get("provider") || "")
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className={styles.modal}>
+      <form className={styles.modalCard} onSubmit={submit}>
+        <div className={styles.title}>New conversation</div>
+        <label className={styles.formStack}>
+          <span className={styles.label}>Type</span>
+          <select className={styles.select} value={kind} onChange={(event) => setKind(event.target.value)}>
+            <option value="assistant">Assistant chat</option>
+            <option value="duo">Two people</option>
+          </select>
+        </label>
+        <label className={styles.formStack}>
+          <span className={styles.label}>Title</span>
+          <input className={styles.input} name="title" maxLength={255} placeholder="New conversation" />
+        </label>
+        {kind === "duo" ? (
+          <div className={styles.split}>
+            <label className={styles.formStack}>
+              <span className={styles.label}>Participant 1</span>
+              <input className={styles.input} name="first" maxLength={128} placeholder="alice" />
+            </label>
+            <label className={styles.formStack}>
+              <span className={styles.label}>Participant 2</span>
+              <input className={styles.input} name="second" maxLength={128} placeholder="bob" />
+            </label>
+          </div>
+        ) : null}
+        <label className={styles.formStack}>
+          <span className={styles.label}>Tone</span>
+          <select className={styles.select} value={tone} onChange={(event) => setTone(event.target.value as ToneId)}>
+            {tones.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <label className={styles.formStack}>
+          <span className={styles.label}>Model</span>
+          <select className={styles.select} name="provider" defaultValue={defaultProvider(providers)?.id}>
+            {providers.map((provider) => (
+              <option key={provider.id} value={provider.id} disabled={provider.available === false}>
+                {providerLabel(provider)}
+              </option>
+            ))}
+          </select>
+        </label>
+        {tone === "custom" ? (
+          <label className={styles.formStack}>
+            <span className={styles.label}>Custom persona</span>
+            <textarea className={styles.textarea} name="persona" maxLength={800} rows={3} />
+          </label>
+        ) : null}
+        <div className={styles.row} style={{ justifyContent: "flex-end" }}>
+          <button type="button" className={styles.ghostButton} onClick={onClose}>
+            Cancel
+          </button>
+          <button className={styles.primaryButton} disabled={busy}>
+            Create
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
