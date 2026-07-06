@@ -16,148 +16,48 @@ import type {
   Task,
   TaskDetail,
   ToolInfo,
-  ToneId,
   ToneInfo,
   TokenResponse,
-  Translation,
+  TranslationSession,
+  TranslationSessionDetail,
+  TranslationTurn,
   User
 } from "@/lib/types";
+import {
+  AUTH_TOKEN_KEY,
+  PROVIDER_CONV_PREFIX,
+  PROVIDER_DEFAULT_KEY,
+  PROVIDER_NOTE_PREFIX,
+  PROVIDER_TRANSLATE_KEY,
+  THEME_KEY,
+  defaultProvider,
+  escapeHtml,
+  fallbackProviders,
+  fallbackTones,
+  newestPreview,
+  normalizeConversation,
+  participants,
+  providerForConversation,
+  providerForNote,
+  providerForTranslate,
+  providerLabel,
+  sanitizeMarkdownHtml,
+  store,
+  stored,
+  timeAgo,
+  toneColor,
+  toneId,
+  toneLabel
+} from "./CueApp.helpers";
+import type { ConversationView, StreamMessage, Tab, TranslationView } from "./CueApp.types";
+import {
+  AuthOverlay,
+  MessageBubble,
+  NewConversationModal,
+  ProviderSelect,
+  TranslationBubble
+} from "./CueApp.widgets";
 import styles from "./CueApp.module.css";
-
-const AUTH_TOKEN_KEY = "cue-auth-token";
-const THEME_KEY = "cue-theme";
-const PROVIDER_DEFAULT_KEY = "cue-provider-default";
-const PROVIDER_CONV_PREFIX = "cue-provider-";
-const PROVIDER_NOTE_PREFIX = "cue-provider-note-";
-
-const fallbackTones: ToneInfo[] = [
-  { id: "friendly", label: "Friendly", color_key: "Friendly" },
-  { id: "professional", label: "Formal", color_key: "Formal" },
-  { id: "humorous", label: "Playful", color_key: "Playful" },
-  { id: "empathetic", label: "Empathetic", color_key: "Empathetic" },
-  { id: "concise", label: "Direct", color_key: "Direct" }
-];
-
-const toneColors: Record<string, string> = {
-  Friendly: "oklch(0.72 0.15 45)",
-  Formal: "oklch(0.65 0.1 250)",
-  Playful: "oklch(0.75 0.15 340)",
-  Empathetic: "oklch(0.7 0.12 150)",
-  Direct: "oklch(0.6 0.14 30)",
-  Technical: "oklch(0.58 0.11 250)",
-  Humorous: "oklch(0.75 0.15 340)"
-};
-
-const fallbackProviders: ProviderInfo[] = [
-  { id: "openrouter", label: "OpenRouter", available: true, model: "" },
-  { id: "openai", label: "OpenAI", available: false, model: "" },
-  { id: "anthropic", label: "Anthropic", available: false, model: "" },
-  { id: "gemini", label: "Gemini", available: false, model: "" },
-  { id: "ollama", label: "Ollama (local)", available: true, model: "" }
-];
-
-type Tab = "chats" | "notes" | "translate" | "tasks";
-type ConversationView = Conversation & {
-  messages: Message[];
-  loaded: boolean;
-  documents: DocumentInfo[];
-  docsLoaded: boolean;
-  docsLoading: boolean;
-  sendAs: string | null;
-};
-
-type StreamMessage = Partial<Message> & {
-  localId: string;
-  role: "user" | "assistant";
-  content: string;
-  streaming?: boolean;
-  error?: boolean;
-};
-
-function stored(key: string) {
-  if (typeof window === "undefined") return null;
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function store(key: string, value: string | null) {
-  try {
-    if (value === null) window.localStorage.removeItem(key);
-    else window.localStorage.setItem(key, value);
-  } catch {
-    // Ignore private browsing storage failures.
-  }
-}
-
-function toneLabel(tones: ToneInfo[], id?: string | null) {
-  return tones.find((tone) => tone.id === id)?.label || "Friendly";
-}
-
-function toneId(tones: ToneInfo[], label?: string | null): ToneId {
-  return (tones.find((tone) => tone.label === label)?.id || "friendly") as ToneId;
-}
-
-function toneColor(tones: ToneInfo[], labelOrId: string) {
-  const tone =
-    tones.find((item) => item.label === labelOrId) || tones.find((item) => item.id === labelOrId);
-  return toneColors[tone?.color_key || tone?.label || labelOrId] || toneColors.Friendly;
-}
-
-function participants(conversation: Conversation) {
-  if (conversation.kind !== "duo") return [];
-  return [
-    conversation.participant_user_id || conversation.user_id,
-    conversation.participant_second_user_id || conversation.second_user_id
-  ].filter(Boolean) as string[];
-}
-
-function normalizeConversation(conversation: Conversation): ConversationView {
-  const people = participants(conversation);
-  return {
-    ...conversation,
-    title: conversation.title || (people.length ? people.join(" & ") : "New conversation"),
-    messages: [],
-    loaded: false,
-    documents: [],
-    docsLoaded: false,
-    docsLoading: false,
-    sendAs: people[0] || null
-  };
-}
-
-function newestPreview(conversation: ConversationView) {
-  return conversation.messages.at(-1)?.content || "No messages yet";
-}
-
-function timeAgo(index: number) {
-  return ["2m ago", "1h ago", "Yesterday", "3d ago"][index] || "Earlier";
-}
-
-function defaultProvider(providers: ProviderInfo[]) {
-  const saved = stored(PROVIDER_DEFAULT_KEY);
-  return (
-    providers.find((provider) => provider.id === saved && provider.available !== false) ||
-    providers.find((provider) => provider.available !== false) ||
-    providers[0]
-  );
-}
-
-function providerForConversation(id: string, providers: ProviderInfo[]) {
-  return stored(PROVIDER_CONV_PREFIX + id) || defaultProvider(providers)?.id || "";
-}
-
-function providerForNote(id: string | null, providers: ProviderInfo[]) {
-  return (id && stored(PROVIDER_NOTE_PREFIX + id)) || defaultProvider(providers)?.id || "";
-}
-
-function providerLabel(provider: ProviderInfo) {
-  return `${provider.model ? `${provider.label} (${provider.model})` : provider.label}${
-    provider.available === false ? " - no key" : ""
-  }`;
-}
 
 export function CueApp() {
   const [theme, setTheme] = useState("light");
@@ -192,11 +92,14 @@ export function CueApp() {
   const [regenPrompt, setRegenPrompt] = useState("");
   const [regenPending, setRegenPending] = useState(false);
 
-  const [translations, setTranslations] = useState<Translation[]>([]);
+  const [translationSessions, setTranslationSessions] = useState<TranslationSession[]>([]);
   const [activeTranslationId, setActiveTranslationId] = useState<string | null>(null);
+  const [activeTranslation, setActiveTranslation] = useState<TranslationView | null>(null);
+  const [loadingTranslation, setLoadingTranslation] = useState(false);
   const [languages, setLanguages] = useState<Language[]>([]);
   const [translateText, setTranslateText] = useState("");
   const [translateLanguage, setTranslateLanguage] = useState("");
+  const [translateProvider, setTranslateProvider] = useState("");
   const [translatePending, setTranslatePending] = useState(false);
 
   const [tools, setTools] = useState<ToolInfo[]>([]);
@@ -209,21 +112,21 @@ export function CueApp() {
   const [taskRunning, setTaskRunning] = useState(false);
 
   const messagesRef = useRef<HTMLDivElement>(null);
+  const translateMessagesRef = useRef<HTMLDivElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   const activeConversation = conversations.find((conversation) => conversation.id === activeId) || null;
   const activeNote = notes.find((note) => note.id === activeNoteId) || null;
-  const activeTranslation =
-    translations.find((translation) => translation.id === activeTranslationId) || null;
   const lastMessageContent = activeConversation?.messages.at(-1)?.content;
+  const lastTranslationTurn = activeTranslation?.turns.at(-1);
 
   const noteHtml = useMemo(() => {
     if (!notePreview || !activeNote?.content) return "";
     try {
       const result = marked.parse(activeNote.content);
-      return typeof result === "string" ? result : "";
+      return typeof result === "string" ? sanitizeMarkdownHtml(result) : "";
     } catch {
-      return activeNote.content;
+      return escapeHtml(activeNote.content);
     }
   }, [activeNote?.content, notePreview]);
 
@@ -234,7 +137,8 @@ export function CueApp() {
     setConversations([]);
     setActiveId(null);
     setNotes([]);
-    setTranslations([]);
+    setTranslationSessions([]);
+    setActiveTranslation(null);
     setTasks([]);
   }, []);
 
@@ -299,7 +203,10 @@ export function CueApp() {
     if (!token) return;
     Promise.all([
       apiJson<ToneInfo[]>("/tones").then(setTones).catch(() => undefined),
-      apiJson<ProviderInfo[]>("/providers").then(setProviders).catch(() => undefined),
+      apiJson<ProviderInfo[]>("/providers").then((rows) => {
+        setProviders(rows);
+        setTranslateProvider((current) => current || providerForTranslate(rows));
+      }).catch(() => undefined),
       apiJson<NoteStyle[]>("/note-styles").then(setNoteStyles).catch(() => undefined),
       apiJson<Language[]>("/languages").then((rows) => {
         setLanguages(rows);
@@ -668,12 +575,24 @@ export function CueApp() {
     }
   }
 
-  async function loadTranslations() {
-    const rows = await api<Translation[]>("/translations");
-    setTranslations(rows);
+  async function loadTranslationSessions() {
+    const rows = await api<TranslationSession[]>("/translations");
+    setTranslationSessions(rows);
     setActiveTranslationId((current) =>
-      current && rows.some((translation) => translation.id === current) ? current : rows[0]?.id || null
+      current && rows.some((session) => session.id === current) ? current : rows[0]?.id || null
     );
+  }
+
+  async function selectTranslationSession(id: string) {
+    setActiveTranslationId(id);
+    setLoadingTranslation(true);
+    try {
+      const detail = await api<TranslationSessionDetail>(`/translations/${id}`);
+      setActiveTranslation({ ...detail, loaded: true });
+      setTranslateLanguage(detail.target_language);
+    } finally {
+      setLoadingTranslation(false);
+    }
   }
 
   async function runTranslation() {
@@ -681,43 +600,82 @@ export function CueApp() {
     setTranslatePending(true);
     try {
       const data = await api<{
-        translation_id: string;
+        session_id: string;
+        turn_id: string;
         translated_text: string;
         romanized_text: string;
         model: string;
+        target_language: string;
       }>("/translations", {
         method: "POST",
-        provider: defaultProvider(providers)?.id || null,
-        json: { source_text: translateText, target_language: translateLanguage }
+        provider: translateProvider || providerForTranslate(providers) || null,
+        json: {
+          source_text: translateText,
+          target_language: translateLanguage,
+          session_id: activeTranslation?.id || null
+        }
       });
-      const now = new Date().toISOString();
-      const row: Translation = {
-        id: data.translation_id,
-        user_id: user?.id || "",
-        title: translateText.slice(0, 50),
+      const turn: TranslationTurn = {
+        id: data.turn_id,
+        turn_index: activeTranslation?.turns.length || 0,
         source_text: translateText,
-        target_language: translateLanguage,
+        target_language: data.target_language,
         translated_text: data.translated_text,
         romanized_text: data.romanized_text,
         model: data.model,
-        is_archived: false,
-        created_at: now,
-        updated_at: now
+        created_at: new Date().toISOString()
       };
-      setTranslations((current) => [row, ...current]);
-      setActiveTranslationId(row.id);
+      const title = activeTranslation?.title || translateText.slice(0, 50) || data.target_language;
+      const sessionSummary: TranslationSession = {
+        id: data.session_id,
+        user_id: user?.id || "",
+        title,
+        target_language: data.target_language,
+        preview: data.translated_text,
+        turn_count: (activeTranslation?.turns.length || 0) + 1,
+        is_archived: false,
+        created_at: activeTranslation?.created_at || turn.created_at,
+        updated_at: turn.created_at
+      };
+      setTranslationSessions((current) => {
+        const without = current.filter((session) => session.id !== data.session_id);
+        return [sessionSummary, ...without];
+      });
+      setActiveTranslationId(data.session_id);
+      setActiveTranslation((current) =>
+        current?.id === data.session_id || !current
+          ? {
+              id: data.session_id,
+              user_id: user?.id || "",
+              title,
+              target_language: data.target_language,
+              is_archived: false,
+              created_at: current?.created_at || turn.created_at,
+              updated_at: turn.created_at,
+              turns: [...(current?.turns || []), turn],
+              loaded: true
+            }
+          : current
+      );
       setTranslateText("");
     } finally {
       setTranslatePending(false);
     }
   }
 
-  async function deleteTranslation(id: string) {
+  async function deleteTranslationSession(id: string) {
     await api<void>(`/translations/${id}`, { method: "DELETE" });
-    setTranslations((current) => current.filter((translation) => translation.id !== id));
-    setActiveTranslationId((current) =>
-      current === id ? translations.find((translation) => translation.id !== id)?.id || null : current
-    );
+    setTranslationSessions((current) => current.filter((session) => session.id !== id));
+    if (activeTranslationId === id) {
+      setActiveTranslationId(null);
+      setActiveTranslation(null);
+    }
+  }
+
+  function startNewTranslationSession() {
+    setActiveTranslationId(null);
+    setActiveTranslation(null);
+    setTranslateText("");
   }
 
   async function loadTasks() {
@@ -758,10 +716,22 @@ export function CueApp() {
   useEffect(() => {
     if (!user) return;
     if (tab === "notes" && !notes.length) void loadNotes();
-    if (tab === "translate" && !translations.length) void loadTranslations();
+    if (tab === "translate" && !translationSessions.length) void loadTranslationSessions();
     if (tab === "tasks" && !tasks.length) void loadTasks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, user]);
+
+  useEffect(() => {
+    if (tab !== "translate" || !activeTranslationId) return;
+    if (activeTranslation?.id === activeTranslationId && activeTranslation.loaded) return;
+    void selectTranslationSession(activeTranslationId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTranslationId, tab]);
+
+  useEffect(() => {
+    if (!translateMessagesRef.current) return;
+    translateMessagesRef.current.scrollTop = translateMessagesRef.current.scrollHeight;
+  }, [lastTranslationTurn?.id, translatePending]);
 
   useEffect(() => {
     if (activeConversation?.use_documents && !activeConversation.docsLoaded && !activeConversation.docsLoading) {
@@ -825,10 +795,7 @@ export function CueApp() {
             className={styles.newButton}
             onClick={() => {
               if (tab === "notes") void createNote();
-              else if (tab === "translate") {
-                setActiveTranslationId(null);
-                setTranslateText("");
-              } else if (tab === "tasks") {
+              else if (tab === "translate") startNewTranslationSession(); else if (tab === "tasks") {
                 setActiveTaskId(null);
                 setActiveTask(null);
               } else setNewModalOpen(true);
@@ -874,14 +841,14 @@ export function CueApp() {
     if (tab === "translate") {
       return (
         <div className={styles.sidebarList}>
-          {translations.map((translation) => (
+          {translationSessions.map((session) => (
             <button
-              key={translation.id}
-              className={`${styles.listItem} ${activeTranslationId === translation.id ? styles.listItemActive : ""}`}
-              onClick={() => setActiveTranslationId(translation.id)}
+              key={session.id}
+              className={`${styles.listItem} ${activeTranslationId === session.id ? styles.listItemActive : ""}`}
+              onClick={() => setActiveTranslationId(session.id)}
             >
-              <span className={styles.listTitle}>{translation.title || translation.target_language}</span>
-              <span className={styles.preview}>{translation.translated_text}</span>
+              <span className={styles.listTitle}>{session.title || session.target_language}</span>
+              <span className={styles.preview}>{session.preview}</span>
             </button>
           ))}
         </div>
@@ -1135,23 +1102,33 @@ export function CueApp() {
         </div>
         <div className={styles.panel}>
           <div className={styles.formStack}>
-            <input
-              className={styles.input}
-              value={activeNote.title || ""}
-              placeholder="Untitled note"
-              onChange={(event) => void saveNote(activeNote, { title: event.target.value })}
-            />
-            {notePreview ? (
-              <div className={`${styles.textarea} ${styles.notePreview}`} dangerouslySetInnerHTML={{ __html: noteHtml }} />
-            ) : (
-              <textarea
-                className={`${styles.textarea} ${styles.noteEditor}`}
-                value={activeNote.content}
-                onChange={(event) => void saveNote(activeNote, { content: event.target.value })}
+            <div className={`${styles.noteBodyWrap} ${regenPending ? styles.noteBodyWrapPending : ""}`}>
+              {regenPending ? (
+                <div className={styles.noteLoadingOverlay}>
+                  <span className={styles.noteSpinner} aria-hidden="true" />
+                  Regenerating note...
+                </div>
+              ) : null}
+              <input
+                className={styles.input}
+                value={activeNote.title || ""}
+                placeholder="Untitled note"
+                disabled={regenPending}
+                onChange={(event) => void saveNote(activeNote, { title: event.target.value })}
               />
-            )}
-            <div className={styles.row}>
-              <select className={styles.select} defaultValue={activeNote.style_name}>
+              {notePreview ? (
+                <div className={`${styles.textarea} ${styles.notePreview}`} dangerouslySetInnerHTML={{ __html: noteHtml }} />
+              ) : (
+                <textarea
+                  className={`${styles.textarea} ${styles.noteEditor}`}
+                  value={activeNote.content}
+                  disabled={regenPending}
+                  onChange={(event) => void saveNote(activeNote, { content: event.target.value })}
+                />
+              )}
+            </div>
+            <div className={`${styles.row} ${regenPending ? styles.noteBodyWrapPending : ""}`}>
+              <select className={styles.select} defaultValue={activeNote.style_name} disabled={regenPending}>
                 {noteStyles.map((style) => (
                   <option key={style.id} value={style.id}>
                     {style.label}
@@ -1161,12 +1138,17 @@ export function CueApp() {
               <input
                 className={styles.input}
                 value={regenPrompt}
+                disabled={regenPending}
                 onChange={(event) => setRegenPrompt(event.target.value)}
                 placeholder="Regenerate instruction"
                 style={{ flex: 1 }}
               />
-              <button className={styles.primaryButton} disabled={regenPending} onClick={() => void regenerateNote()}>
-                Regenerate
+              <button
+                className={styles.primaryButton}
+                disabled={regenPending || !regenPrompt.trim()}
+                onClick={() => void regenerateNote()}
+              >
+                {regenPending ? "Regenerating..." : "Regenerate"}
               </button>
             </div>
           </div>
@@ -1176,21 +1158,24 @@ export function CueApp() {
   }
 
   function renderTranslations() {
+    const composerLocked = translatePending || !llmAvailable;
+    const sendDisabled = !translateText.trim() || composerLocked || !translateLanguage;
+    const sessionTitle =
+      activeTranslation?.title || activeTranslation?.target_language || translateLanguage || "New translation";
+
     return (
       <>
         <div className={styles.header}>
           <div className={styles.headerTitle}>
-            <div className={styles.title}>Translate</div>
-            <div className={styles.subtitle}>{translations.length} saved translations</div>
+            <div className={styles.title}>{sessionTitle}</div>
+            <div className={styles.subtitle}>
+              {activeTranslation?.turns.length
+                ? `${activeTranslation.turns.length} translation${activeTranslation.turns.length === 1 ? "" : "s"}`
+                : "Start a translation chat"}
+            </div>
           </div>
-          {activeTranslation ? (
-            <button className={styles.dangerButton} onClick={() => void deleteTranslation(activeTranslation.id)}>
-              🗑
-            </button>
-          ) : null}
-        </div>
-        <div className={styles.panel}>
-          <div className={styles.formStack}>
+          <div className={styles.controls}>
+            <span className={styles.label}>Language</span>
             <select
               className={styles.select}
               value={translateLanguage}
@@ -1202,23 +1187,67 @@ export function CueApp() {
                 </option>
               ))}
             </select>
+            <span className={styles.label}>Model</span>
+            <ProviderSelect
+              providers={providers}
+              value={translateProvider || providerForTranslate(providers)}
+              onChange={(value) => {
+                store(PROVIDER_TRANSLATE_KEY, value);
+                store(PROVIDER_DEFAULT_KEY, value);
+                setTranslateProvider(value);
+              }}
+            />
+            {activeTranslation ? (
+              <button
+                className={styles.dangerButton}
+                onClick={() => void deleteTranslationSession(activeTranslation.id)}
+              >
+                🗑
+              </button>
+            ) : null}
+          </div>
+        </div>
+        {healthChecked && !llmAvailable ? (
+          <div className={styles.statusBar}>LLM unavailable — translation is disabled.</div>
+        ) : null}
+        <div className={styles.messages} ref={translateMessagesRef}>
+          {loadingTranslation ? <div className={styles.empty}>Loading translation...</div> : null}
+          {activeTranslation?.turns.map((turn) => (
+            <div key={turn.id}>
+              <TranslationBubble mine label="You" text={turn.source_text} />
+              <TranslationBubble
+                label={`Translation · ${turn.target_language}`}
+                text={turn.translated_text}
+              />
+              {turn.romanized_text.trim() ? (
+                <TranslationBubble label="Romanized" text={turn.romanized_text} />
+              ) : null}
+            </div>
+          ))}
+        </div>
+        <div className={styles.composerWrap}>
+          <div className={styles.composer}>
             <textarea
-              className={styles.textarea}
-              rows={6}
-              placeholder="Text to translate"
+              className={styles.draft}
+              rows={3}
+              placeholder="Paste or type text to translate..."
               value={translateText}
               onChange={(event) => setTranslateText(event.target.value)}
+              onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void runTranslation();
+                }
+              }}
             />
-            <button className={styles.primaryButton} disabled={translatePending} onClick={() => void runTranslation()}>
-              Translate
+            <button className={styles.sendButton} disabled={sendDisabled} onClick={() => void runTranslation()}>
+              ↑
             </button>
-            {activeTranslation ? (
-              <div className={styles.card}>
-                <h3>{activeTranslation.target_language}</h3>
-                <p>{activeTranslation.translated_text}</p>
-                <p className={styles.preview}>{activeTranslation.romanized_text}</p>
-              </div>
-            ) : null}
+          </div>
+          <div className={styles.hint}>
+            {translatePending
+              ? "Translating..."
+              : "Enter to translate · Shift+Enter for new line · continue in the same session for context"}
           </div>
         </div>
       </>
@@ -1304,215 +1333,4 @@ export function CueApp() {
       </>
     );
   }
-}
-
-function AuthOverlay({
-  onSubmit,
-  error
-}: {
-  onSubmit: (mode: "login" | "register", event: FormEvent<HTMLFormElement>) => void;
-  error: string;
-}) {
-  const [mode, setMode] = useState<"login" | "register">("login");
-  const modeRef = useRef(mode);
-  return (
-    <div className={styles.modal}>
-      <form className={styles.authCard} onSubmit={(event) => onSubmit(modeRef.current, event)}>
-        <div className={styles.brandName}>Cue</div>
-        <div className={styles.preview}>{error}</div>
-        <input className={styles.input} name="email" type="email" autoComplete="email" placeholder="Email" required />
-        <input
-          className={styles.input}
-          name="password"
-          type="password"
-          autoComplete={mode === "login" ? "current-password" : "new-password"}
-          placeholder="Password"
-          required
-        />
-        <div className={styles.split}>
-          <button className={styles.primaryButton} type="submit" onClick={() => { setMode("login"); modeRef.current = "login"; }}>
-            Login
-          </button>
-          <button className={styles.ghostButton} type="submit" onClick={() => { setMode("register"); modeRef.current = "register"; }}>
-            Register
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function ProviderSelect({
-  providers,
-  value,
-  onChange
-}: {
-  providers: ProviderInfo[];
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  const selected = value || defaultProvider(providers)?.id || "";
-  return (
-    <select className={styles.select} value={selected} onChange={(event) => onChange(event.target.value)}>
-      {providers.map((provider) => (
-        <option key={provider.id} value={provider.id} disabled={provider.available === false}>
-          {providerLabel(provider)}
-        </option>
-      ))}
-    </select>
-  );
-}
-
-function MessageBubble({
-  message,
-  mine,
-  isDuo,
-  onDelete
-}: {
-  message: Message | StreamMessage;
-  mine: boolean;
-  isDuo: boolean;
-  onDelete?: () => void;
-}) {
-  const sender = isDuo && message.user_id ? `${message.user_id}${message.model ? " · AI draft" : ""}` : message.role === "user" ? "You" : "Assistant";
-  return (
-    <div className={`${styles.messageRow} ${mine ? styles.messageMine : styles.messageOther}`}>
-      {mine && onDelete ? (
-        <button className={styles.deleteInline} onClick={onDelete}>
-          x
-        </button>
-      ) : null}
-      <div className={`${styles.messageStack} ${mine ? styles.messageStackMine : styles.messageStackOther}`}>
-        <div className={styles.sender}>{sender}</div>
-        <div className={`${styles.bubble} ${mine ? styles.bubbleMine : ""}`}>
-          {message.content}
-          {(message as StreamMessage).streaming ? <span className={styles.cursor} /> : null}
-        </div>
-        {!mine && message.citations?.length ? (
-          <div className={styles.sources}>
-            Sources:
-            {message.citations.map((citation) => (
-              <span key={`${citation.document_id}-${citation.marker}`} title={citation.snippet}>
-                [{citation.marker}] {citation.filename}
-                {citation.page ? ` p.${citation.page}` : ""}
-              </span>
-            ))}
-          </div>
-        ) : null}
-      </div>
-      {!mine && onDelete ? (
-        <button className={styles.deleteInline} onClick={onDelete}>
-          x
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-function NewConversationModal({
-  tones,
-  providers,
-  onClose,
-  onCreate
-}: {
-  tones: ToneInfo[];
-  providers: ProviderInfo[];
-  onClose: () => void;
-  onCreate: (payload: {
-    title?: string;
-    tone_name: string;
-    custom_persona?: string;
-    participants?: string[];
-    provider?: string;
-  }) => Promise<void>;
-}) {
-  const [kind, setKind] = useState("assistant");
-  const [tone, setTone] = useState<ToneId>("friendly");
-  const [busy, setBusy] = useState(false);
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const first = String(form.get("first") || "").trim();
-    const second = String(form.get("second") || "").trim();
-    if (kind === "duo" && (!first || !second || first === second)) return;
-    setBusy(true);
-    try {
-      await onCreate({
-        title: String(form.get("title") || "").trim() || undefined,
-        tone_name: tone,
-        custom_persona: tone === "custom" ? String(form.get("persona") || "").trim() || undefined : undefined,
-        participants: kind === "duo" ? [first, second] : undefined,
-        provider: String(form.get("provider") || "")
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className={styles.modal}>
-      <form className={styles.modalCard} onSubmit={submit}>
-        <div className={styles.title}>New conversation</div>
-        <label className={styles.formStack}>
-          <span className={styles.label}>Type</span>
-          <select className={styles.select} value={kind} onChange={(event) => setKind(event.target.value)}>
-            <option value="assistant">Assistant chat</option>
-            <option value="duo">Two people</option>
-          </select>
-        </label>
-        <label className={styles.formStack}>
-          <span className={styles.label}>Title</span>
-          <input className={styles.input} name="title" maxLength={255} placeholder="New conversation" />
-        </label>
-        {kind === "duo" ? (
-          <div className={styles.split}>
-            <label className={styles.formStack}>
-              <span className={styles.label}>Participant 1</span>
-              <input className={styles.input} name="first" maxLength={128} placeholder="alice" />
-            </label>
-            <label className={styles.formStack}>
-              <span className={styles.label}>Participant 2</span>
-              <input className={styles.input} name="second" maxLength={128} placeholder="bob" />
-            </label>
-          </div>
-        ) : null}
-        <label className={styles.formStack}>
-          <span className={styles.label}>Tone</span>
-          <select className={styles.select} value={tone} onChange={(event) => setTone(event.target.value as ToneId)}>
-            {tones.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-              </option>
-            ))}
-            <option value="custom">Custom</option>
-          </select>
-        </label>
-        <label className={styles.formStack}>
-          <span className={styles.label}>Model</span>
-          <select className={styles.select} name="provider" defaultValue={defaultProvider(providers)?.id}>
-            {providers.map((provider) => (
-              <option key={provider.id} value={provider.id} disabled={provider.available === false}>
-                {providerLabel(provider)}
-              </option>
-            ))}
-          </select>
-        </label>
-        {tone === "custom" ? (
-          <label className={styles.formStack}>
-            <span className={styles.label}>Custom persona</span>
-            <textarea className={styles.textarea} name="persona" maxLength={800} rows={3} />
-          </label>
-        ) : null}
-        <div className={styles.row} style={{ justifyContent: "flex-end" }}>
-          <button type="button" className={styles.ghostButton} onClick={onClose}>
-            Cancel
-          </button>
-          <button className={styles.primaryButton} disabled={busy}>
-            Create
-          </button>
-        </div>
-      </form>
-    </div>
-  );
 }

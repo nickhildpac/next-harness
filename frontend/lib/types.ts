@@ -114,18 +114,31 @@ export type NoteStyle = {
   label: string;
 };
 
-export type Translation = {
+export type TranslationTurn = {
   id: string;
-  user_id: string;
-  title: string | null;
+  turn_index: number;
   source_text: string;
   target_language: string;
   translated_text: string;
   romanized_text: string;
   model: string | null;
+  created_at: string;
+};
+
+export type TranslationSession = {
+  id: string;
+  user_id: string;
+  title: string | null;
+  target_language: string;
+  preview: string;
+  turn_count: number;
   is_archived: boolean;
   created_at: string;
   updated_at: string;
+};
+
+export type TranslationSessionDetail = Omit<TranslationSession, "preview" | "turn_count"> & {
+  turns: TranslationTurn[];
 };
 
 export type Language = {

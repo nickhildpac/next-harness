@@ -551,6 +551,49 @@
   min-height: 55vh;
 }
 
+.noteBodyWrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.noteBodyWrapPending {
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+}
+
+.noteLoadingOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-radius: 10px;
+  background: color-mix(in oklch, var(--surface-body) 72%, transparent);
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.noteSpinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border-input);
+  border-top-color: oklch(0.7 0.15 45);
+  border-radius: 50%;
+  animation: noteSpin 0.7s linear infinite;
+}
+
+@keyframes noteSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .notePreview {
   width: 100%;
   min-height: 55vh;
@@ -692,6 +735,12 @@
   padding: 10px 18px;
   border-radius: 10px;
   cursor: pointer;
+}
+
+.primaryButton:disabled {
+  background: var(--disabled-bg);
+  cursor: default;
+  opacity: 0.85;
 }
 
 .ghostButton {
