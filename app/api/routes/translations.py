@@ -2,7 +2,12 @@ from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_current_user, get_translation_service
 from app.db.models import User
-from app.schemas.translation import TranslateResponse, TranslationCreate, TranslationResponse
+from app.schemas.translation import (
+    TranslateResponse,
+    TranslationCreate,
+    TranslationSessionResponse,
+    TranslationSessionSummary,
+)
 from app.services.translations import TranslationService
 
 router = APIRouter(tags=["translations"])
@@ -39,20 +44,20 @@ async def create_translation(
     return await service.translate(payload)
 
 
-@router.get("/translations", response_model=list[TranslationResponse])
+@router.get("/translations", response_model=list[TranslationSessionSummary])
 async def list_translations(
     current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
-) -> list[TranslationResponse]:
+) -> list[TranslationSessionSummary]:
     return await service.list_for_user(current_user.id)
 
 
-@router.get("/translations/{translation_id}", response_model=TranslationResponse)
+@router.get("/translations/{translation_id}", response_model=TranslationSessionResponse)
 async def get_translation(
     translation_id: str,
     current_user: User = Depends(get_current_user),
     service: TranslationService = Depends(get_translation_service),
-) -> TranslationResponse:
+) -> TranslationSessionResponse:
     return await service.get(translation_id, current_user.id)
 
 

@@ -143,12 +143,31 @@ class Translation(Base, IdMixin, TimestampMixin):
 
     user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    target_language: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    turns: Mapped[list["TranslationTurn"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="TranslationTurn.turn_index",
+    )
+
+
+class TranslationTurn(Base, IdMixin, TimestampMixin):
+    __tablename__ = "translation_turns"
+    __table_args__ = (Index("ix_translation_turns_session_index", "translation_id", "turn_index"),)
+
+    translation_id: Mapped[str] = mapped_column(
+        ForeignKey("translations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_language: Mapped[str] = mapped_column(String(64), nullable=False)
     translated_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     romanized_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    session: Mapped[Translation] = relationship(back_populates="turns")
 
 
 class TaskStatus(str, Enum):

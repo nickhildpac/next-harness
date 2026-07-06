@@ -52,11 +52,45 @@ async def test_translate_persists_and_returns_result(session):
     assert result.romanized_text == "Hola"
     assert result.target_language == "Spanish"
     assert result.model == "fake-model"
+    assert result.session_id
+    assert result.turn_id
 
     listed = await service.list_for_user("alice")
     assert len(listed) == 1
-    assert listed[0].source_text == "Hello"
+    assert listed[0].preview == "Hola"
     assert listed[0].target_language == "Spanish"
+    assert listed[0].turn_count == 1
+
+    detail = await service.get(result.session_id, "alice")
+    assert len(detail.turns) == 1
+    assert detail.turns[0].source_text == "Hello"
+
+
+async def test_translate_appends_turn_to_existing_session(session):
+    llm = FakeLLM(reply="TRANSLATION:\nHola\n\nROMANIZED:\nHola")
+    service = make_service(session, llm)
+
+    first = await service.translate(
+        TranslationCreate(user_id="alice", source_text="Hello", target_language="Spanish")
+    )
+    llm.reply = "TRANSLATION:\nAdiós\n\nROMANIZED:\nAdios"
+    second = await service.translate(
+        TranslationCreate(
+            user_id="alice",
+            source_text="Goodbye",
+            session_id=first.session_id,
+        )
+    )
+
+    assert second.session_id == first.session_id
+    assert second.translated_text == "Adiós"
+    assert len(llm.calls) == 2
+    assert len(llm.calls[1]) == 4
+    assert llm.calls[1][-1].content == "Goodbye"
+
+    detail = await service.get(first.session_id, "alice")
+    assert len(detail.turns) == 2
+    assert detail.turns[1].source_text == "Goodbye"
 
 
 async def test_translate_scoped_to_user(session):
@@ -66,7 +100,7 @@ async def test_translate_scoped_to_user(session):
     )
 
     with pytest.raises(HTTPException) as exc:
-        await service.get(created.translation_id, "bob")
+        await service.get(created.session_id, "bob")
     assert exc.value.status_code == 404
 
 
@@ -76,6 +110,6 @@ async def test_delete_archives_translation(session):
         TranslationCreate(user_id="alice", source_text="hi", target_language="French")
     )
 
-    await service.delete(created.translation_id, "alice")
+    await service.delete(created.session_id, "alice")
 
     assert await service.list_for_user("alice") == []

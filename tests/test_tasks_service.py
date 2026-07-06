@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.db.models import Document, Note, Translation
+from app.db.models import Document, Note, Translation, TranslationTurn
 from app.ports.llm import ChatMessage, GenerationParams, LLMResult
 from app.schemas.task import TaskCreate
 from app.services.tasks import TaskService
@@ -142,8 +142,10 @@ async def test_agent_can_translate_and_save_text(session):
     assert detail.status == "completed"
     row = await session.scalar(select(Translation).where(Translation.user_id == "alice"))
     assert row is not None
-    assert row.translated_text == "hola"
     assert row.target_language == "Spanish"
+    turn = await session.scalar(select(TranslationTurn).where(TranslationTurn.translation_id == row.id))
+    assert turn is not None
+    assert turn.translated_text == "hola"
 
 
 async def test_agent_can_ingest_and_search_task_documents(session):
