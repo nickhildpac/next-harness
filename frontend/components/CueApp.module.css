@@ -665,6 +665,93 @@
   font-size: 13px;
 }
 
+.taskToolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.taskHint {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.taskMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.taskMeta span {
+  padding: 3px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-body);
+}
+
+.taskFileList {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.taskFilePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-card);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.taskStepHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.taskStepHeader span {
+  color: var(--text-secondary);
+}
+
+.taskStepIndex {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  font-size: 11px;
+}
+
+.taskStepOk,
+.taskStepFailed {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.taskStepOk {
+  background: var(--tint-ok);
+  color: var(--ok);
+}
+
+.taskStepFailed {
+  background: var(--tint-err);
+  color: var(--err);
+}
+
 .taskStepError {
   border-left-color: var(--err);
   background: var(--tint-err);

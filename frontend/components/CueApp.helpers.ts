@@ -1,4 +1,4 @@
-import type { Conversation, ProviderInfo, ToneId, ToneInfo } from "@/lib/types";
+import type { Conversation, ProviderInfo, TaskStep, ToneId, ToneInfo } from "@/lib/types";
 import type { ConversationView } from "./CueApp.types";
 
 export const AUTH_TOKEN_KEY = "cue-auth-token";
@@ -121,6 +121,71 @@ export function providerLabel(provider: ProviderInfo) {
   return `${provider.model ? `${provider.label} (${provider.model})` : provider.label}${
     provider.available === false ? " - no key" : ""
   }`;
+}
+
+export const taskToolPresets = [
+  {
+    id: "notes-summary",
+    label: "Notes summary",
+    description: "List notes, read note bodies, then create a summary note.",
+    tools: ["list_notes", "get_note", "create_note"]
+  },
+  {
+    id: "rag",
+    label: "Task RAG",
+    description: "Ingest, list, and search documents attached to this task run.",
+    tools: ["ingest_task_document", "list_task_documents", "search_task_documents"]
+  },
+  {
+    id: "translate",
+    label: "Translation",
+    description: "Translate text and inspect saved translation sessions.",
+    tools: ["translate_text", "list_translations"]
+  }
+] as const;
+
+export function requiredToolsForTaskGoal(goal: string) {
+  const text = goal.toLowerCase();
+  const mentionsDocuments = /\b(documents?|files?|pdfs?|uploads?|uploaded)\b/.test(text);
+  if (mentionsDocuments) return ["list_task_documents", "search_task_documents"];
+
+  const mentionsNotes = /\bnotes?\b/.test(text);
+  if (!mentionsNotes) return [];
+
+  const asksToSummarize = /\b(summarize|summarise|summary|recap)\b/.test(text);
+  const asksToCreate = /\b(create|save|write|persist|new)\b/.test(text);
+  if (asksToSummarize && asksToCreate) return ["list_notes", "get_note", "create_note"];
+
+  const asksForList = /\b(list|show|display|recent|latest|last)\b/.test(text);
+  if (asksForList) return ["list_notes"];
+
+  const asksToRead = /\b(read|get|open|inspect|content|body)\b/.test(text);
+  if (asksToRead) return ["list_notes", "get_note"];
+
+  return [];
+}
+
+export function taskStepLabel(step: TaskStep) {
+  if (step.kind === "thought") return "Reason";
+  if (step.kind === "tool_call") return "Tool call";
+  if (step.kind === "tool_result") return "Tool result";
+  if (step.kind === "final") return "Final answer";
+  if (step.kind === "error") return "Error";
+  return step.kind;
+}
+
+export function taskStepDetail(step: TaskStep) {
+  if (step.kind === "tool_call" && step.tool_name) return `Calling ${step.tool_name}`;
+  if (step.kind === "tool_result" && step.tool_name) {
+    return step.ok === false ? `${step.tool_name} failed` : `${step.tool_name} returned`;
+  }
+  return step.tool_name || "";
+}
+
+export function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 const markdownAllowedTags = new Set([

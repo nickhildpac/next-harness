@@ -32,6 +32,7 @@ import {
   THEME_KEY,
   defaultProvider,
   escapeHtml,
+  formatFileSize,
   fallbackProviders,
   fallbackTones,
   newestPreview,
@@ -41,9 +42,13 @@ import {
   providerForNote,
   providerForTranslate,
   providerLabel,
+  requiredToolsForTaskGoal,
   sanitizeMarkdownHtml,
   store,
   stored,
+  taskStepDetail,
+  taskStepLabel,
+  taskToolPresets,
   timeAgo,
   toneColor,
   toneId,
@@ -108,6 +113,7 @@ export function CueApp() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<TaskDetail | null>(null);
   const [taskGoal, setTaskGoal] = useState("");
+  const [taskFiles, setTaskFiles] = useState<File[]>([]);
   const [maxSteps, setMaxSteps] = useState(8);
   const [taskRunning, setTaskRunning] = useState(false);
 
@@ -693,18 +699,43 @@ export function CueApp() {
 
   async function runTask() {
     if (!taskGoal.trim()) return;
+    const availableToolNames = new Set(tools.map((tool) => tool.name));
+    const selected = new Set(selectedTools);
+    const taskDocumentTools = taskFiles.length ? ["list_task_documents", "search_task_documents"] : [];
+    for (const toolName of [...requiredToolsForTaskGoal(taskGoal), ...taskDocumentTools]) {
+      if (availableToolNames.has(toolName)) selected.add(toolName);
+    }
+    if (tools.length > 0 && selected.size === 0) return;
+    if (selected.size !== selectedTools.size) setSelectedTools(selected);
     setTaskRunning(true);
     try {
-      const allowed = Array.from(selectedTools);
-      const task = await api<TaskDetail>("/tasks", {
-        method: "POST",
-        json: {
-          goal: taskGoal,
-          max_steps: maxSteps,
-          allowed_tools: allowed.length === tools.length ? null : allowed
-        }
-      });
+      const allowed = Array.from(selected);
+      const allowedTools = tools.length === 0 || allowed.length === tools.length ? null : allowed;
+      let task: TaskDetail;
+      if (taskFiles.length) {
+        const form = new FormData();
+        form.append("goal", taskGoal);
+        form.append("max_steps", String(maxSteps));
+        if (allowedTools) form.append("allowed_tools", JSON.stringify(allowedTools));
+        for (const file of taskFiles) form.append("files", file);
+        const response = await apiFetch("/tasks/with-documents", {
+          method: "POST",
+          token,
+          body: form
+        });
+        task = (await response.json()) as TaskDetail;
+      } else {
+        task = await api<TaskDetail>("/tasks", {
+          method: "POST",
+          json: {
+            goal: taskGoal,
+            max_steps: maxSteps,
+            allowed_tools: allowedTools
+          }
+        });
+      }
       setTaskGoal("");
+      setTaskFiles([]);
       setActiveTaskId(task.id);
       setActiveTask(task);
       await loadTasks();
@@ -798,6 +829,7 @@ export function CueApp() {
               else if (tab === "translate") startNewTranslationSession(); else if (tab === "tasks") {
                 setActiveTaskId(null);
                 setActiveTask(null);
+                setTaskFiles([]);
               } else setNewModalOpen(true);
             }}
           >
@@ -1255,6 +1287,23 @@ export function CueApp() {
   }
 
   function renderTasks() {
+    const availableToolNames = new Set(tools.map((tool) => tool.name));
+    const requiredToolNames = [
+      ...new Set([
+        ...requiredToolsForTaskGoal(taskGoal),
+        ...(taskFiles.length ? ["list_task_documents", "search_task_documents"] : [])
+      ])
+    ].filter((toolName) => availableToolNames.has(toolName));
+    const missingRequiredToolNames = requiredToolNames.filter((toolName) => !selectedTools.has(toolName));
+    const effectiveSelectedTools = new Set([...selectedTools, ...requiredToolNames]);
+    const availablePresets = taskToolPresets
+      .map((preset) => ({
+        ...preset,
+        tools: preset.tools.filter((toolName) => availableToolNames.has(toolName))
+      }))
+      .filter((preset) => preset.tools.length > 0);
+    const taskRunDisabled = taskRunning || !taskGoal.trim() || (tools.length > 0 && effectiveSelectedTools.size === 0);
+
     return (
       <>
         <div className={styles.header}>
@@ -1272,6 +1321,14 @@ export function CueApp() {
               value={taskGoal}
               onChange={(event) => setTaskGoal(event.target.value)}
             />
+            {requiredToolNames.length ? (
+              <div className={styles.taskHint}>
+                <strong>Detected workflow:</strong> this goal needs {requiredToolNames.join(", ")}.
+                {missingRequiredToolNames.length
+                  ? ` Missing tools will be added when the task runs: ${missingRequiredToolNames.join(", ")}.`
+                  : " Required tools are selected."}
+              </div>
+            ) : null}
             <div className={styles.row}>
               <input
                 className={styles.input}
@@ -1281,10 +1338,62 @@ export function CueApp() {
                 value={maxSteps}
                 onChange={(event) => setMaxSteps(Number(event.target.value) || 8)}
               />
-              <button className={styles.primaryButton} disabled={taskRunning} onClick={() => void runTask()}>
-                Run task
+              <button className={styles.primaryButton} disabled={taskRunDisabled} onClick={() => void runTask()}>
+                {taskRunning ? "Running..." : "Run task"}
               </button>
             </div>
+            <div className={styles.taskToolbar}>
+              <button
+                className={styles.ghostButton}
+                onClick={() => setSelectedTools(new Set(tools.map((tool) => tool.name)))}
+              >
+                All tools
+              </button>
+              <button className={styles.ghostButton} onClick={() => setSelectedTools(new Set())}>
+                Clear
+              </button>
+              {availablePresets.map((preset) => (
+                <button
+                  key={preset.id}
+                  className={styles.ghostButton}
+                  title={preset.description}
+                  onClick={() => setSelectedTools(new Set(preset.tools))}
+                >
+                  {preset.label}
+                </button>
+              ))}
+              <label className={styles.ghostButton} title="Attach .pdf, .txt, or .md files to this task run">
+                Attach documents
+                <input
+                  type="file"
+                  multiple
+                  accept=".pdf,.txt,.md"
+                  style={{ display: "none" }}
+                  onChange={(event) => {
+                    const files = Array.from(event.target.files || []);
+                    setTaskFiles((current) => [...current, ...files]);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
+            {taskFiles.length ? (
+              <div className={styles.taskFileList}>
+                {taskFiles.map((file, index) => (
+                  <span key={`${file.name}-${file.size}-${index}`} className={styles.taskFilePill}>
+                    {file.name} · {formatFileSize(file.size)}
+                    <button
+                      className={styles.smallButton}
+                      onClick={() => setTaskFiles((current) => current.filter((_, i) => i !== index))}
+                    >
+                      Remove
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <div className={styles.hint}>Attach .pdf, .txt, or .md files to ingest them into the next task run.</div>
+            )}
             <div className={styles.row} style={{ flexWrap: "wrap" }}>
               {tools.map((tool) => (
                 <button
@@ -1301,15 +1410,37 @@ export function CueApp() {
                   style={{
                     borderColor: selectedTools.has(tool.name) ? "var(--accent)" : "var(--border-input)"
                   }}
+                  title={tool.description}
                 >
                   {tool.name}
                 </button>
               ))}
             </div>
+            {tools.length > 0 && selectedTools.size === 0 ? (
+              <div className={styles.taskHint}>
+                {requiredToolNames.length
+                  ? `Required tools will be added when the task runs: ${requiredToolNames.join(", ")}.`
+                  : "Select at least one tool, or choose All tools."}
+              </div>
+            ) : (
+              <div className={styles.hint}>
+                {effectiveSelectedTools.size === tools.length
+                  ? "All registered tools are available. The backend keeps finish in scope automatically."
+                  : `${effectiveSelectedTools.size} of ${tools.length} tools selected. The backend keeps finish in scope automatically.`}
+              </div>
+            )}
             {activeTask ? (
               <div className={styles.formStack}>
                 <div className={styles.card}>
                   <strong>{activeTask.status}</strong>
+                  <div className={styles.taskMeta}>
+                    <span>{activeTask.steps_taken} reason turn(s)</span>
+                    <span>max {activeTask.max_steps}</span>
+                    <span>{activeTask.model || "model unknown"}</span>
+                    <span>
+                      tools: {activeTask.allowed_tools?.length ? activeTask.allowed_tools.join(", ") : "all registered"}
+                    </span>
+                  </div>
                   <p>{activeTask.result_summary || activeTask.error || activeTask.goal}</p>
                 </div>
                 {activeTask.steps.map((step) => (
@@ -1319,7 +1450,16 @@ export function CueApp() {
                       step.kind === "final" ? styles.taskStepFinal : step.kind === "error" || step.ok === false ? styles.taskStepError : ""
                     }`}
                   >
-                    <strong>{step.tool_name ? `${step.kind} · ${step.tool_name}` : step.kind}</strong>
+                    <div className={styles.taskStepHeader}>
+                      <span className={styles.taskStepIndex}>#{step.step_index}</span>
+                      <strong>{taskStepLabel(step)}</strong>
+                      {taskStepDetail(step) ? <span>{taskStepDetail(step)}</span> : null}
+                      {step.ok !== null ? (
+                        <span className={step.ok ? styles.taskStepOk : styles.taskStepFailed}>
+                          {step.ok ? "ok" : "failed"}
+                        </span>
+                      ) : null}
+                    </div>
                     {step.content ? <p>{step.content}</p> : null}
                     {step.payload ? <pre className={styles.pre}>{JSON.stringify(step.payload, null, 2)}</pre> : null}
                   </div>
