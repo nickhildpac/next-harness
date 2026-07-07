@@ -35,9 +35,12 @@ tool set, and press **Run task** to watch the agent's reasoning, tool calls, and
 ## LLM provider
 
 Providers wired through the same `LLMClient` port: OpenRouter, OpenAI, Anthropic, Gemini, Ollama.
-`LLM_PROVIDER=openrouter` is the default; when `OPENROUTER_API_KEY` is unset, the app falls back to
-local Ollama automatically. Per-request override: `X-LLM-Provider: openai` (or
-`?llm_provider=openai`). Ollama is expected at `http://localhost:11434` with `llama3.1` pulled.
+`LLM_PROVIDER=openrouter` is the default for chat, notes, and translations; when
+`OPENROUTER_API_KEY` is unset, the app falls back to local Ollama automatically. Per-request
+override: `X-LLM-Provider: openai` (or `?llm_provider=openai`). Agent tasks use
+`TASK_LLM_PROVIDER` (default `openai`) so task tool-following can be tuned independently. Set
+`TASK_OPENAI_MODEL` to override `OPENAI_MODEL` for task agents only. Ollama is expected at
+`http://localhost:11434` with `llama3.1` pulled.
 
 ```bash
 ollama pull llama3.1
@@ -56,6 +59,8 @@ SQLite is the default for local development. Compose overrides `DATABASE_URL` to
 Task/agent surface (primary):
 
 - `POST /tasks` — create + run an agent task. Body: `{"goal": "...", "user_id": "...", "max_steps": 8, "allowed_tools": ["list_notes", "create_note"]}`. Also accepts `prompt`/`objective`/`task` as goal aliases. Set `run: false` to persist without running.
+- `POST /tasks/{task_id}/documents` — attach a `.pdf`, `.txt`, or `.md` document to a pending task with multipart form data. Uploaded documents become task-scoped RAG context for `list_task_documents` and `search_task_documents`.
+- `POST /tasks/{task_id}/run` — run a pending task after optional document uploads.
 - `GET /tasks?user_id=...` — list past runs.
 - `GET /tasks/{task_id}` — inspect a run (status, `result_summary`, per-step trace).
 - `GET /tools` — introspect registered tools and their JSON parameter schemas.
@@ -71,6 +76,8 @@ Chat/notes/translations surface (secondary):
 
 ## Built-in tools
 
-`now`, `list_notes`, `get_note`, `create_note`, `list_translations`, `http_fetch`, `finish`. The
-`finish` tool is how the agent signals task completion — it always stays in scope even when
-`allowed_tools` is narrowed. Add your own by dropping a `Tool` into `app/tools/builtins.py:all_tools`.
+`now`, `list_notes`, `get_note`, `create_note`, `update_note`, `list_translations`,
+`translate_text`, `ingest_task_document`, `list_task_documents`, `search_task_documents`,
+`http_fetch`, `finish`. The `finish` tool is how the agent signals task completion — it always
+stays in scope even when `allowed_tools` is narrowed. Add your own by dropping a `Tool` into
+`app/tools/builtins.py:all_tools`.

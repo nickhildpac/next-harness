@@ -1,4 +1,5 @@
 import io
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -88,6 +89,28 @@ async def test_ingest_txt_creates_chunks_and_vectors(session):
     )
     assert all(row.page is None for row in rows)
     assert all(row.conversation_id == conversation.id for row in rows)
+    assert set(rag.vectorstore.records) == {row.id for row in rows}
+
+
+async def test_ingest_can_defer_commit_to_caller(session, monkeypatch):
+    conversation = await make_conversation(session)
+    rag = make_rag(session)
+    commit = AsyncMock()
+    monkeypatch.setattr(session, "commit", commit)
+
+    document = await rag.ingest(
+        conversation.id,
+        filename="notes.txt",
+        content_type="text/plain",
+        data=b"Deferred commit document",
+        commit=False,
+    )
+
+    commit.assert_not_awaited()
+    rows = list(
+        await session.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id))
+    )
+    assert rows
     assert set(rag.vectorstore.records) == {row.id for row in rows}
 
 

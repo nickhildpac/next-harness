@@ -89,14 +89,43 @@ def test_task_llm_client_uses_openai_even_when_default_is_openrouter():
     from app.adapters.openai import OpenAIClient
     from app.api.dependencies import get_task_llm_client
     from app.core.config import Settings
+    from app.ports.llm import GenerationParams
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
     client = get_task_llm_client(
         request,
-        Settings(llm_provider="openrouter", openrouter_api_key="test-key", openai_api_key="test-key"),
+        Settings(
+            llm_provider="openrouter",
+            openrouter_api_key="test-key",
+            openai_api_key="test-key",
+            task_openai_model="gpt-4.1-mini",
+        ),
     )
 
     assert isinstance(client, OpenAIClient)
+    assert client.resolve_model(
+        GenerationParams(model="ignored", temperature=0.1, top_p=0.9, timeout_seconds=1)
+    ) == "gpt-4.1-mini"
+
+
+def test_task_llm_provider_can_be_configured_independently():
+    from types import SimpleNamespace
+
+    from app.adapters.openrouter import OpenRouterClient
+    from app.api.dependencies import get_task_llm_client
+    from app.core.config import Settings
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
+    client = get_task_llm_client(
+        request,
+        Settings(
+            llm_provider="ollama",
+            task_llm_provider="openrouter",
+            openrouter_api_key="test-key",
+        ),
+    )
+
+    assert isinstance(client, OpenRouterClient)
 
 
 def test_anthropic_provider_used_when_key_configured():

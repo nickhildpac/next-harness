@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     llm_provider: Literal[
         "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"
     ] = "openrouter"
+    task_llm_provider: Literal[
+        "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"
+    ] = "openai"
     ollama_base_url: AnyHttpUrl = "http://localhost:11434"
     openrouter_base_url: AnyHttpUrl = "https://openrouter.ai/api/v1"
     openrouter_api_key: str | None = None
@@ -33,6 +36,7 @@ class Settings(BaseSettings):
     openrouter_app_name: str | None = None
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
+    task_openai_model: str | None = None
     openai_base_url: str | None = None
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-4-5"
@@ -61,6 +65,13 @@ class Settings(BaseSettings):
     @classmethod
     def empty_dimensions_as_none(cls, value):
         # Allow a blank EMBEDDING_DIMENSIONS= line in .env, matching the optional key style.
+        if value == "":
+            return None
+        return value
+
+    @field_validator("task_openai_model", mode="before")
+    @classmethod
+    def empty_task_openai_model_as_none(cls, value):
         if value == "":
             return None
         return value

@@ -45,9 +45,11 @@ routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
   `GeminiClient` all implement `LLMClient`.
 - **`app/tools/`** — provider-neutral tool layer. `registry.py` holds the `Tool`/`ToolRegistry`
   types; `builtins.py` registers the default tools (`now`, `list_notes`, `get_note`, `create_note`,
-  `list_translations`, `http_fetch`, `finish`); `protocol.py` renders the tool manifest into a system
-  prompt and parses `<tool_call>{...}</tool_call>` JSON blocks out of assistant text — that
-  fenced-JSON contract is how tools work with every adapter, no provider-native tool API required.
+  `update_note`, `list_translations`, `translate_text`, `ingest_task_document`,
+  `list_task_documents`, `search_task_documents`, `http_fetch`, `finish`); `protocol.py` renders the
+  tool manifest into a system prompt and parses `<tool_call>{...}</tool_call>` JSON blocks out of
+  assistant text — that fenced-JSON contract is how tools work with every adapter, no
+  provider-native tool API required.
 - **`app/orchestration/agent_graph.py`** — LangGraph loop with two nodes: `reason` (LLM turn) →
   `act` (dispatch tool calls) → `reason` again. Exits when the model emits `finish`, produces a
   reply with no tool calls, or hits `max_steps`.
@@ -67,10 +69,13 @@ routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
 
 ### LLM provider selection
 
-Provider resolution happens per-request in `build_llm_client`. Precedence:
-1. Per-request override: `X-LLM-Provider` header or `?llm_provider=` query param (`openrouter` | `ollama` | `auto`).
+Provider resolution for chat/notes/translations happens per-request in `build_llm_client`. Precedence:
+1. Per-request override: `X-LLM-Provider` header or `?llm_provider=` query param (`openrouter` | `ollama` | `auto` | `openai` | `anthropic` | `gemini`).
 2. `LLM_PROVIDER` setting (default `openrouter`).
 3. Automatic fallback: `openrouter`/`auto` **falls back to Ollama when `OPENROUTER_API_KEY` is unset**.
+
+Agent tasks use `TASK_LLM_PROVIDER` (default `openai`) so task tool-following can be tuned
+independently from chat. Set `TASK_OPENAI_MODEL` to override `OPENAI_MODEL` for task agents only.
 
 Note: generation currently uses `settings.default_model` (Ollama's `llama3.1`) for `GenerationParams`;
 the OpenRouter model is set inside its adapter. Ollama is expected at `localhost:11434`.
@@ -135,6 +140,9 @@ Task/agent surface (primary):
 - `POST /tasks` — create + run an agent task (`goal`, optional `user_id`, `max_steps`,
   `allowed_tools`, `run=false` to just persist). Response is the full `TaskDetail` including every
   step. `prompt`/`objective`/`task` are accepted as aliases for `goal`.
+- `POST /tasks/{task_id}/documents` — attach `.pdf`, `.txt`, or `.md` uploads to a pending task as
+  task-scoped RAG context.
+- `POST /tasks/{task_id}/run` — run a pending task after optional document uploads.
 - `GET /tasks?user_id=...`, `GET /tasks/{task_id}` — list and inspect runs.
 - `GET /tools` — introspect the registered tool set (name, description, JSON schema).
 

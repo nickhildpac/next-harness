@@ -59,6 +59,7 @@ class RagService:
         content_type: str | None,
         data: bytes,
         owner_user_id: str | None = None,
+        commit: bool = True,
     ) -> Document:
         await self._conversation_or_404(conversation_id, owner_user_id=owner_user_id)
         return await self._ingest(
@@ -67,10 +68,17 @@ class RagService:
             filename=filename,
             content_type=content_type,
             data=data,
+            commit=commit,
         )
 
     async def ingest_task_document(
-        self, task_id: str, *, filename: str, content_type: str | None, data: bytes
+        self,
+        task_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+        commit: bool = True,
     ) -> Document:
         await self._task_or_404(task_id)
         return await self._ingest(
@@ -79,6 +87,7 @@ class RagService:
             filename=filename,
             content_type=content_type,
             data=data,
+            commit=commit,
         )
 
     async def _ingest(
@@ -89,6 +98,7 @@ class RagService:
         filename: str,
         content_type: str | None,
         data: bytes,
+        commit: bool,
     ) -> Document:
         if len(data) > self.settings.rag_max_upload_bytes:
             raise HTTPException(
@@ -127,7 +137,8 @@ class RagService:
                     for row, vector in zip(rows, vectors)
                 ]
             )
-            await self.session.commit()
+            if commit:
+                await self.session.commit()
         except Exception:
             await self.session.rollback()
             await self._delete_vectors(document.id)

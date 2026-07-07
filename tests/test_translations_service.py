@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi import HTTPException
 
@@ -64,6 +66,22 @@ async def test_translate_persists_and_returns_result(session):
     detail = await service.get(result.session_id, "alice")
     assert len(detail.turns) == 1
     assert detail.turns[0].source_text == "Hello"
+
+
+async def test_translate_can_defer_commit_to_caller(session, monkeypatch):
+    llm = FakeLLM(reply="TRANSLATION:\nHola\n\nROMANIZED:\nHola")
+    service = make_service(session, llm)
+    commit = AsyncMock()
+    monkeypatch.setattr(session, "commit", commit)
+
+    result = await service.translate(
+        TranslationCreate(user_id="alice", source_text="Hello", target_language="Spanish"),
+        commit=False,
+    )
+
+    commit.assert_not_awaited()
+    detail = await service.get(result.session_id, "alice")
+    assert detail.turns[0].translated_text == "Hola"
 
 
 async def test_translate_appends_turn_to_existing_session(session):

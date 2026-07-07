@@ -13,6 +13,7 @@ from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import GenerationParams, LLMClient
 from app.ports.vectorstore import VectorStore
+from app.repositories.documents import DocumentRepository
 from app.repositories.tasks import TaskRepository
 from app.schemas.task import TaskCreate, TaskDetail, TaskResponse, TaskStepResponse, ToolInfo
 from app.services.rag import RagService
@@ -53,33 +54,58 @@ class TaskService:
             for spec in self._registry.specs()
         ]
 
-    async def create_task(
-        self, payload: TaskCreate, documents: list[TaskDocumentUpload] | None = None
-    ) -> TaskDetail:
-        registry = self._scoped_registry(payload.allowed_tools)
+    async def create_task(self, payload: TaskCreate) -> TaskDetail:
         task = await self.repo.create(
             user_id=payload.user_id,
             goal=payload.goal,
             max_steps=payload.max_steps,
             allowed_tools=payload.allowed_tools,
         )
-        uploaded_document_count = 0
-        if documents:
-            uploaded_document_count = await self._ingest_documents(task.id, documents)
         if not payload.run:
             await self.session.commit()
             return await self._detail(task.id)
+        return await self._run_task(task)
 
-        graph = AgentGraph(self.llm, registry, max_steps=payload.max_steps)
+    async def run_task(self, task_id: str, user_id: str) -> TaskDetail:
+        task = await self._task_for_user(task_id, user_id)
+        if task.status != TaskStatus.pending.value:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Task cannot be run from status '{task.status}'.",
+            )
+        return await self._run_task(task)
+
+    async def upload_task_document(
+        self, task_id: str, user_id: str, document: TaskDocumentUpload
+    ):
+        task = await self._task_for_user(task_id, user_id)
+        if task.status != TaskStatus.pending.value:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Documents can only be attached while task is pending, not '{task.status}'.",
+            )
+        uploaded = await self._ingest_documents(task.id, [document])
+        if uploaded != 1:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Document upload failed.",
+            )
+        documents = await DocumentRepository(self.session).list_by_task(task.id)
+        return documents[-1]
+
+    async def _run_task(self, task: AgentTask) -> TaskDetail:
+        registry = self._scoped_registry(task.allowed_tools)
+        uploaded_document_count = await self._task_document_count(task.id)
+        graph = AgentGraph(self.llm, registry, max_steps=task.max_steps)
         await self.repo.set_status(task, TaskStatus.running)
         await self.session.commit()
         run = await graph.run(
-            payload.goal,
+            task.goal,
             self._params(),
             ToolContext(
                 session=self.session,
                 http_client=self.http_client,
-                user_id=payload.user_id,
+                user_id=task.user_id,
                 task_id=task.id,
                 settings=self.settings,
                 llm=self.llm,
@@ -189,9 +215,19 @@ class TaskService:
                 filename=document.filename,
                 content_type=document.content_type,
                 data=document.data,
+                commit=True,
             )
             count += 1
         return count
+
+    async def _task_for_user(self, task_id: str, user_id: str) -> AgentTask:
+        task = await self.repo.get(task_id)
+        if task is None or task.user_id != user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        return task
+
+    async def _task_document_count(self, task_id: str) -> int:
+        return len(await DocumentRepository(self.session).list_by_task(task_id))
 
     def _step_kind(self, step: StepRecord) -> TaskStepKind:
         return TaskStepKind(step.kind)

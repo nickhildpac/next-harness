@@ -39,7 +39,7 @@ class TranslationService:
         self.token_counter = TokenCounter()
         self.graph = ChatGraph(llm)
 
-    async def translate(self, payload: TranslationCreate) -> TranslateResponse:
+    async def translate(self, payload: TranslationCreate, *, commit: bool = True) -> TranslateResponse:
         if payload.session_id:
             session = await self._or_404(payload.session_id, payload.user_id, with_turns=True)
             target_language = payload.target_language or session.target_language
@@ -84,7 +84,8 @@ class TranslationService:
             session.title = payload.source_text.strip()[:50] or None
         session.target_language = target_language
         await self.repo.touch_session(session)
-        await self.session.commit()
+        if commit:
+            await self.session.commit()
         logger.info(
             "translation_completed",
             extra={

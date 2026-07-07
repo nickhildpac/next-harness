@@ -67,16 +67,20 @@ def get_task_llm_client(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> LLMClient:
-    # Agent tasks need reliable instruction following and tool-call markup. Keep them on the
-    # OpenAI adapter instead of inheriting the app-wide OpenRouter/default provider selection.
     http_client = getattr(request.app.state, "http_client", None)
-    return OpenAIClient(settings, TokenCounter(), http_client)
+    return build_llm_client(
+        settings,
+        settings.task_llm_provider,
+        http_client=http_client,
+        openai_model_override=settings.task_openai_model,
+    )
 
 
 def build_llm_client(
     settings: Settings,
     provider: str | None = None,
     http_client: httpx.AsyncClient | None = None,
+    openai_model_override: str | None = None,
 ) -> LLMClient:
     token_counter = TokenCounter()
     requested = (provider or settings.llm_provider).lower()
@@ -90,7 +94,12 @@ def build_llm_client(
     # provider/model with no signal to the caller.
     if requested == "openai":
         if _has_key(settings.openai_api_key):
-            return OpenAIClient(settings, token_counter, http_client)
+            return OpenAIClient(
+                settings,
+                token_counter,
+                http_client,
+                model_override=openai_model_override,
+            )
         raise _unconfigured_provider_error("openai", "OPENAI_API_KEY")
     if requested == "anthropic":
         if _has_key(settings.anthropic_api_key):

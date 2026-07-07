@@ -1,117 +1,129 @@
-# Backend Agent Task Review
+# Architecture Decision Records
 
-## Current Shape
+This file records the current task-agent decisions that are not obvious from the code alone.
 
-The backend exposes a task-running agent via `POST /tasks`. `TaskService` creates an `AgentTask`, builds a scoped `ToolRegistry`, runs `AgentGraph`, persists step traces, and then returns `TaskDetail`.
+## ADR-001: Provider-Neutral Task Tool Protocol
 
-The core loop is simple:
+Status: Accepted
 
-1. LLM reason turn
-2. Parse `<tool_call>{...}</tool_call>` blocks
-3. Invoke tools
-4. Feed tool observations back
-5. Stop on finish, no tool call, error, or step limit.
+Date: 2026-07-07
 
-## What’s Good
+### Context
 
-- **Clean Service Boundary**: `app/api/routes/tasks.py` only handles auth/user scoping, while `TaskService` (line 22) owns task creation/run/persistence.
-- **Compact and Testable Agent Loop**: `AgentGraph` (line 57) has clear reason and act nodes.
-- **Tool Scoping Supported**: `allowed_tools` supports tool scoping, and `finish` is always available (tasks.py line 104).
-- **Useful Step Tracing**: The system records `thought`, `tool_call`, `tool_result`, `final`, and `error` steps through `TaskStepResponse` (line 34).
+The backend supports OpenRouter, OpenAI, Anthropic, Gemini, and Ollama through the shared
+`LLMClient` port in `app/ports/llm.py`. These providers do not expose identical native tool-calling
+APIs, and Ollama/local models are useful during development. Task runs also need a provider-agnostic
+trace of reasoning, tool calls, tool observations, and final output.
 
+### Decision
 
+Task agents use the provider-neutral `<tool_call>{...}</tool_call>` text protocol as the primary
+tool-calling contract. `app/tools/protocol.py` renders the tool manifest into the system prompt and
+parses assistant output. `app/orchestration/agent_graph.py` drives the reason/act loop and dispatches
+parsed calls through `ToolRegistry`.
 
-## Main Issues
+Native provider tool APIs can be added later as adapter-level optimizations, but they should preserve
+the same `ToolRegistry`, task step trace, and error observation behavior.
 
+### Consequences
 
+- The same task loop works across hosted providers and local Ollama.
+- Tool calls and observations are easy to persist in `AgentTaskStep` rows.
+- The model can produce malformed text or no tool call. Current mitigations live in
+  `AgentGraph`: explicit tool-use prompting, empty-response retries, false-refusal retry text, and
+  structured tool error observations.
+- Future native-tool support must not bypass task step persistence or the registry permission model.
 
-### Task execution is synchronous and fragile for long agent runs
+## ADR-002: Task Documents Are First-Class Attachments
 
-`POST /tasks` runs the full agent inline before returning (tasks.py line 47). If the server dies mid-run, the task may remain running, and intermediate steps are only persisted after `graph.run` completes.
+Status: Accepted
 
-**Suggested fix**: Move execution to a background worker/job queue. `POST /tasks` should create a pending task and return immediately; a worker should append steps as they happen. Add `POST /tasks/{id}/run`, `POST /tasks/{id}/cancel`, and streaming/polling for step updates.
+Date: 2026-07-07
 
-### Tool writes are not transactionally consistent
+### Context
 
-Some tools write via the shared task session and commit at the end, but others commit internally. `translate_text` calls `TranslationService.translate`, which commits inside the service (translations.py line 87). RAG ingestion also commits inside `rag.py` (line 130). This means a tool can persist side effects even if the task later fails or the trace is never persisted.
+Task creation and document-backed task creation previously used different request shapes. That made
+callers choose between JSON task creation and a separate multipart creation flow for the same task
+concept.
 
-**Suggested fix**: Define a consistent contract: either all tools are transactional under the task run, or side-effecting tools are explicitly “committed actions” with compensating metadata. For agents, explicit side-effect logs/outbox records are preferred.
+### Decision
 
-### `allowed_tools` silently accepts invalid tool names
+Use one task lifecycle:
 
-`_scoped_registry` always adds `finish`, so `allowed_tools=["bad_tool"]` still creates a registry containing `finish` and does not hit the “did not match” error (tasks.py line 107).
+1. `POST /tasks` creates a task from JSON. `run: false` creates a pending task.
+2. `POST /tasks/{task_id}/documents` attaches `.pdf`, `.txt`, or `.md` files to a pending task.
+3. `POST /tasks/{task_id}/run` runs the pending task.
 
-**Suggested fix**: Validate requested tools before adding `finish`. Return 400 with unknown tool names.
+Uploaded documents are task-scoped RAG context. The agent can inspect them with
+`list_task_documents` and `search_task_documents`.
 
-### Tool schemas are advertised but not centrally enforced
+### Consequences
 
-`Tool.parameters` is included in the manifest, but `ToolRegistry.invoke` passes arguments straight to handlers (registry.py line 88). Validation is scattered in each handler.
+- Clients have one task creation contract and add documents as attachments.
+- Upload/ingestion failures happen before the task run starts.
+- The frontend can still expose a single "Run task" action by creating the task, uploading staged
+  files, and then running it.
+- Task document behavior is explicit in `app/api/routes/tasks.py` and `app/services/tasks.py`.
 
-**Suggested fix**: Validate arguments against each tool’s JSON Schema before invocation. Return structured `ToolError` for schema failures.
+## ADR-003: Task Agents Use Explicit LLM Provider Configuration
 
-### `http_fetch` is too powerful for an autonomous agent
+Status: Accepted
 
-The tool allows arbitrary HTTP(S) fetches (builtins.py line 293). That creates SSRF/internal network risk if exposed broadly.
+Date: 2026-07-07
 
-**Suggested fix**: Do not include `http_fetch` by default. Require allowlisted domains, block localhost/private IP ranges after DNS resolution, cap response streaming before reading full text, and disable redirects or validate redirect targets.
+### Context
 
-### Custom tool-call parsing is pragmatic but brittle
+Chat, notes, and translations can tolerate a broader provider policy. Agent tasks are more sensitive
+to tool-following behavior because the model must emit valid tool calls and recover from tool
+observations.
 
-`parse_tool_calls` uses regex against assistant text (protocol.py line 23). It silently ignores malformed JSON (protocol.py line 64).
+### Decision
 
-**Suggested fix**: Keep this provider-neutral protocol for now, but add a repair/retry path when malformed calls are detected. For providers that support native tools, consider optional adapter-native tool calling later.
+General LLM traffic uses `LLM_PROVIDER` and request overrides through `build_llm_client`. Agent tasks
+use `TASK_LLM_PROVIDER` instead, with `TASK_OPENAI_MODEL` available as a task-only OpenAI model
+override.
 
-## How To Utilize Agents
+### Consequences
 
-Use agents for bounded, multi-step workflows where the model needs to decide which backend capability to call next. Do not use them for simple CRUD, direct chat, or deterministic API calls.
+- Task reliability can be tuned independently from chat.
+- The default task policy is visible in config instead of being hidden in dependency wiring.
+- Provider drift should be documented in `.env.example`, `README.md`, and `AGENTS.md` whenever these
+  settings change.
 
-### Good current use cases:
+## ADR-004: Tool Side Effects Follow Task Commit Semantics
 
-- **Personal knowledge/RAG task**
-  - **Use tools**: `ingest_task_document`, `search_task_documents`, `create_note`, `finish`.
-  - **Example goal**: “Read this pasted policy text, extract key obligations, and save a checklist note.”
-- **Note organization**
-  - **Use tools**: `list_notes`, `get_note`, `create_note`, `update_note`, `finish`.
-  - **Example goal**: “Find my rough notes about LangGraph and consolidate them into a clean technical summary.”
-- **Translation workflow**
-  - **Use tools**: `translate_text`, `list_translations`, `finish`.
-  - **Example goal**: “Translate this text into Spanish and save the result.”
-- **Inspection/research workflow**
-  - **Use tools**: `http_fetch` (only if domain-restricted).
-  - **Example goal**: “Fetch this public API response and summarize the fields.”
+Status: Accepted
 
+Date: 2026-07-07
 
+### Context
 
-### Recommended request pattern:
+Agent tools can create notes, translations, and task documents. If those services commit internally,
+a tool side effect can persist even when the task later fails or the task trace is not committed.
 
-For general note summarization:
+### Decision
 
-```json
-{
-  "goal": "Summarize my notes about RAG and save a concise implementation checklist.",
-  "max_steps": 8,
-  "allowed_tools": ["list_notes", "get_note", "create_note"]
-}
-```
+Direct API service calls keep their default commit behavior. Task tool handlers call side-effecting
+services with commit deferral where supported, so database writes commit with the final task trace.
+First-class document attachments are different: `POST /tasks/{task_id}/documents` is a user action
+before the run, so ingestion commits before the agent starts.
 
-For RAG:
+### Consequences
 
-```json
-{
-  "goal": "Ingest this document text, search it for deployment risks, and produce a cited summary.",
-  "max_steps": 10,
-  "allowed_tools": ["ingest_task_document", "search_task_documents"]
-}
-```
+- Agent-created notes/translations and task trace rows share the same database transaction.
+- Task attachment ingestion is durable before execution, which gives the agent stable RAG context.
+- Vector-store writes are still external to the SQL transaction. Retrieval should continue to ignore
+  orphaned vector hits that no longer have matching SQL document rows.
 
+## Current Known Tradeoffs
 
-
-## Best Next Backend Improvements
-
-- Add agent profiles/tool presets: `note_agent`, `rag_agent`, `translation_agent`, `research_agent`. Each profile maps to a safe `allowed_tools` set and system prompt extension.
-- Add background execution with persisted incremental steps.
-- Add tool argument validation in `ToolRegistry`.
-- Add side-effect policy: dry-run, confirm-before-write, or committed-action logs.
-- Harden or remove default `http_fetch`.
-
-The existing backend is a good prototype foundation. The next step is turning the current “general tool-using loop” into explicit, safe, domain-specific agent workflows.
+- Task execution still runs inline in the request/response path. Long-running tasks would be more
+  robust behind a worker with persisted incremental step updates and cancellation.
+- `Tool.parameters` schemas are advertised to the model, but argument validation is still enforced
+  mostly inside handlers. Central JSON Schema validation in `ToolRegistry.invoke` would make tool
+  failures more consistent.
+- `http_fetch` remains broad for an autonomous agent. Before exposing it widely, add domain
+  allowlists, private-network blocking after DNS resolution, redirect validation, and tighter
+  response limits.
+- Database tables are created with `Base.metadata.create_all` on startup. Production use needs
+  migrations.

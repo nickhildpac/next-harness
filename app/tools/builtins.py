@@ -195,7 +195,7 @@ async def _translate_text(args: dict[str, Any], context: ToolContext) -> dict[st
                 "target_language": args.get("target_language"),
             }
         )
-        result = await service.translate(payload)
+        result = await service.translate(payload, commit=False)
     except HTTPException as exc:
         raise _tool_error_from_http(exc) from exc
     except ValueError as exc:
@@ -205,7 +205,6 @@ async def _translate_text(args: dict[str, Any], context: ToolContext) -> dict[st
         row = await service.repo.get(result.translation_id)
         if row is not None:
             await service.repo.archive(row)
-            await service.session.commit()
     return {
         "translation_id": result.translation_id if save is not False else None,
         "saved": save is not False,
@@ -232,6 +231,7 @@ async def _ingest_task_document(args: dict[str, Any], context: ToolContext) -> d
             filename=filename,
             content_type=args.get("content_type"),
             data=content.encode("utf-8"),
+            commit=False,
         )
     except HTTPException as exc:
         raise _tool_error_from_http(exc) from exc

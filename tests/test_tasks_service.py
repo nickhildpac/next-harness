@@ -232,18 +232,27 @@ async def test_agent_can_search_preuploaded_task_documents(session):
         vectorstore=vectorstore,
     )
 
-    detail = await service.create_task(
-        TaskCreate(goal="Summarize the uploaded document", user_id="alice", max_steps=6),
-        documents=[
-            TaskDocumentUpload(
-                filename="facts.md",
-                content_type="text/markdown",
-                data=b"Apples and bananas are fruit salad ingredients.",
-            )
-        ],
+    pending = await service.create_task(
+        TaskCreate(
+            goal="Summarize the uploaded document",
+            user_id="alice",
+            max_steps=6,
+            run=False,
+        )
     )
+    uploaded = await service.upload_task_document(
+        pending.id,
+        "alice",
+        TaskDocumentUpload(
+            filename="facts.md",
+            content_type="text/markdown",
+            data=b"Apples and bananas are fruit salad ingredients.",
+        ),
+    )
+    detail = await service.run_task(pending.id, "alice")
 
     assert detail.status == "completed"
+    assert uploaded.task_id == detail.id
     document = await session.scalar(select(Document).where(Document.task_id == detail.id))
     assert document is not None
     assert document.filename == "facts.md"
@@ -284,6 +293,7 @@ def test_openapi_exposes_task_routes():
 
     paths = app.openapi()["paths"]
     assert "/tasks" in paths
-    assert "/tasks/with-documents" in paths
+    assert "/tasks/{task_id}/documents" in paths
+    assert "/tasks/{task_id}/run" in paths
     assert "/tasks/{task_id}" in paths
     assert "/tools" in paths

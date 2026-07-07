@@ -18,11 +18,13 @@ class OpenAIClient(LLMClient):
         settings: Settings,
         token_counter: TokenCounter,
         http_client: httpx.AsyncClient | None = None,
+        model_override: str | None = None,
     ):
         self.settings = settings
         self.token_counter = token_counter
         self._http = http_client
         self._client_instance: AsyncOpenAI | None = None
+        self.model_override = model_override
 
     def _client(self) -> AsyncOpenAI:
         if self._client_instance is None:
@@ -35,14 +37,14 @@ class OpenAIClient(LLMClient):
         return self._client_instance
 
     def resolve_model(self, params: GenerationParams) -> str:
-        return self.settings.openai_model
+        return self._model()
 
     async def health(self) -> bool:
         return bool(self.settings.openai_api_key)
 
     async def chat(self, messages: list[ChatMessage], params: GenerationParams) -> LLMResult:
         response = await self._client().chat.completions.create(
-            model=self.settings.openai_model,
+            model=self._model(),
             messages=[{"role": m.role, "content": m.content} for m in messages],
             temperature=params.temperature,
             top_p=params.top_p,
@@ -53,7 +55,7 @@ class OpenAIClient(LLMClient):
         usage = response.usage
         return LLMResult(
             content=content,
-            model=response.model or self.settings.openai_model,
+            model=response.model or self._model(),
             input_tokens=(usage.prompt_tokens if usage else None)
             or self.token_counter.count_messages(messages),
             output_tokens=(usage.completion_tokens if usage else None)
@@ -64,7 +66,7 @@ class OpenAIClient(LLMClient):
         self, messages: list[ChatMessage], params: GenerationParams
     ) -> AsyncIterator[str]:
         stream = await self._client().chat.completions.create(
-            model=self.settings.openai_model,
+            model=self._model(),
             messages=[{"role": m.role, "content": m.content} for m in messages],
             temperature=params.temperature,
             top_p=params.top_p,
@@ -78,3 +80,6 @@ class OpenAIClient(LLMClient):
             content = getattr(delta, "content", None)
             if content:
                 yield content
+
+    def _model(self) -> str:
+        return self.model_override or self.settings.openai_model
