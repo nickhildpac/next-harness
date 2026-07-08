@@ -45,7 +45,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router)
     app.include_router(notes.router)
     app.include_router(translations.router)
-    app.mount("/app", StaticFiles(directory="app/static", html=True), name="app")
+    # app.mount("/app", StaticFiles(directory="app/static", html=True), name="app")
 
     @app.get("/", include_in_schema=False)
     async def index_redirect() -> RedirectResponse:
