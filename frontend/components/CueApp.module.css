@@ -460,26 +460,25 @@
 }
 
 .composer {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 8px 8px 8px 16px;
   border: 1.5px solid var(--border-soft);
   border-radius: 16px;
   background: var(--surface-card);
   box-shadow: 0 1px 4px oklch(0.3 0.02 50 / 0.05);
+  overflow: hidden;
 }
 
 .draft {
-  flex: 1;
+  display: block;
+  width: 100%;
   max-height: 220px;
-  padding: 8px 0;
+  padding: 12px 16px;
   border: 0;
   outline: none;
   resize: none;
   background: transparent;
   color: var(--text-body);
   font-size: 14.5px;
+  box-sizing: border-box;
 }
 
 .sendButton,
@@ -510,6 +509,28 @@
   border: 1.5px solid var(--border-input);
   background: var(--surface-card);
   font-size: 16px;
+}
+
+.composerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-top: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+
+.composerActionsSpacer {
+  flex: 1;
+}
+
+.composerDocs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .hint {

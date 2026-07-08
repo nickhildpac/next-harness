@@ -86,10 +86,36 @@ export function TaskComposer({
           value={maxSteps}
           onChange={(event) => onMaxStepsChange(Number(event.target.value) || 8)}
         />
+        <label className={styles.iconButton} title="Attach .pdf, .txt, or .md files">
+          📎
+          <input
+            type="file"
+            multiple
+            accept=".pdf,.txt,.md"
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const files = Array.from(event.target.files || []);
+              onAddFiles(files);
+              event.target.value = "";
+            }}
+          />
+        </label>
         <button className={styles.primaryButton} disabled={taskRunDisabled} onClick={onRunTask}>
           {taskRunning ? "Running..." : "Run task"}
         </button>
       </div>
+      {taskFiles.length ? (
+        <div className={styles.taskFileList} style={{ marginTop: 8 }}>
+          {taskFiles.map((file, index) => (
+            <span key={`${file.name}-${file.size}-${index}`} className={styles.taskFilePill}>
+              {file.name} · {formatFileSize(file.size)}
+              <button className={styles.smallButton} onClick={() => onRemoveFile(index)}>
+                Remove
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div className={styles.taskToolbar}>
         <button className={styles.ghostButton} onClick={onSelectAllTools}>
           All tools
@@ -107,35 +133,7 @@ export function TaskComposer({
             {preset.label}
           </button>
         ))}
-        <label className={styles.ghostButton} title="Attach .pdf, .txt, or .md files to this task run">
-          Attach documents
-          <input
-            type="file"
-            multiple
-            accept=".pdf,.txt,.md"
-            style={{ display: "none" }}
-            onChange={(event) => {
-              const files = Array.from(event.target.files || []);
-              onAddFiles(files);
-              event.target.value = "";
-            }}
-          />
-        </label>
       </div>
-      {taskFiles.length ? (
-        <div className={styles.taskFileList}>
-          {taskFiles.map((file, index) => (
-            <span key={`${file.name}-${file.size}-${index}`} className={styles.taskFilePill}>
-              {file.name} · {formatFileSize(file.size)}
-              <button className={styles.smallButton} onClick={() => onRemoveFile(index)}>
-                Remove
-              </button>
-            </span>
-          ))}
-        </div>
-      ) : (
-        <div className={styles.hint}>Attach .pdf, .txt, or .md files to ingest them into the next task run.</div>
-      )}
       <div className={styles.row} style={{ flexWrap: "wrap" }}>
         {tools.map((tool) => (
           <button
