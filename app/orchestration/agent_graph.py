@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, StateGraph, add_messages
 
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall
 from app.tools.protocol import format_tool_result, parse_tool_calls, render_tool_manifest
@@ -47,12 +47,21 @@ class AgentRun:
     model: str | None = None
     steps: list[StepRecord] = field(default_factory=list)
     turns_used: int = 0
+    # FIX #3: Track retry turns separately. One-shot retries (tool_refusal, required_tool,
+    # empty_response) increment retry_turns; actual work increments turns_used. Step limit
+    # applies to turns_used only, not retry turns (retries are free corrections).
+    retry_turns: int = 0
 
 
+# FIX #5: Use idiomatic LangGraph pattern with Annotated reducer. Nodes return message updates,
+# not the full state. This is clearer, checkpointable, and protects against concurrent mutation.
 class _AgentState(TypedDict, total=False):
     run: AgentRun
-    messages: list[BaseMessage]
+    messages: Annotated[list[BaseMessage], add_messages]
     turn: int
+    # FIX #3: Track work turns separately from retry turns. Work turns are used for tool calls;
+    # retry turns are free corrections and don't count against the step limit.
+    work_turn: int
     params: GenerationParams
     context: "ToolContext"
     pending_calls: list[ToolCall]
@@ -106,6 +115,7 @@ class AgentGraph:
             "run": run,
             "messages": messages,
             "turn": 0,
+            "work_turn": 0,  # FIX #3: Only incremented for non-retry reasoning turns.
             "params": params,
             "context": context,
             "pending_calls": [],
@@ -126,14 +136,21 @@ class AgentGraph:
     async def _reason(self, state: _AgentState) -> _AgentState:
         run = state["run"]
         params = state["params"]
+        is_retry = state.get("retry_reason", False)
         state["retry_reason"] = False
         state["turn"] = state["turn"] + 1
-        run.turns_used = state["turn"]
+        # FIX #3: Only increment work_turn for non-retry reasoning. Retries are free.
+        if not is_retry:
+            state["work_turn"] = state["work_turn"] + 1
+            run.turns_used = state["work_turn"]
+        else:
+            run.retry_turns = run.retry_turns + 1
         result = await self.llm.chat(self._to_port_messages(state["messages"]), params)
         run.model = result.model
         content = result.content or ""
         parsed = parse_tool_calls(content)
-        state["messages"].append(AIMessage(content=content))
+        # FIX #5: Return message updates instead of mutating state in place.
+        messages_to_add: list[BaseMessage] = [AIMessage(content=content)]
         if parsed.thought:
             run.steps.append(StepRecord(kind="thought", content=parsed.thought))
 
@@ -141,7 +158,7 @@ class AgentGraph:
             if self._should_retry_false_tool_refusal(content, state):
                 state["tool_refusal_retried"] = True
                 state["retry_reason"] = True
-                state["messages"].append(
+                messages_to_add.append(
                     HumanMessage(
                         content=(
                             "Correction: you do have access to the listed tools. "
@@ -150,17 +167,19 @@ class AgentGraph:
                         )
                     )
                 )
+                state["messages"] = messages_to_add
                 return state
             required_tool_hint = self._required_tool_retry_hint(run.goal, state)
             if required_tool_hint:
                 state["required_tool_retried"] = True
                 state["retry_reason"] = True
-                state["messages"].append(HumanMessage(content=required_tool_hint))
+                messages_to_add.append(HumanMessage(content=required_tool_hint))
+                state["messages"] = messages_to_add
                 return state
             if self._should_retry_empty_response(content, state):
                 state["empty_response_retried"] = True
                 state["retry_reason"] = True
-                state["messages"].append(
+                messages_to_add.append(
                     HumanMessage(
                         content=(
                             "Correction: your previous response was empty. "
@@ -169,21 +188,28 @@ class AgentGraph:
                         )
                     )
                 )
+                state["messages"] = messages_to_add
                 return state
             if not content.strip():
                 run.errored = True
                 run.error = "model returned an empty response without tool calls"
                 run.steps.append(StepRecord(kind="error", content=run.error))
                 state["pending_calls"] = []
+                state["messages"] = messages_to_add
                 return state
+            # FIX #1: Model refused to call tools and retries exhausted. Mark as error, not completion.
+            # Only the explicit finish tool sets completed=True.
             summary = parsed.thought or content.strip()
             run.final_summary = summary
-            run.completed = True
-            run.steps.append(StepRecord(kind="final", content=summary))
+            run.errored = True
+            run.error = "model refused to call tools"
+            run.steps.append(StepRecord(kind="error", content=f"Model refusal: {summary}"))
             state["pending_calls"] = []
+            state["messages"] = messages_to_add
             return state
 
         state["pending_calls"] = list(parsed.tool_calls)
+        state["messages"] = messages_to_add
         return state
 
     async def _act(self, state: _AgentState) -> _AgentState:
@@ -211,16 +237,20 @@ class AgentGraph:
                 )
             )
             tool_results.append(result)
+            # FIX #4: Short-circuit batch on successful finish to avoid wasted tool calls.
             if call.name == "finish" and result.ok:
                 summary = (result.output or {}).get("summary") if isinstance(result.output, dict) else None
                 run.final_summary = summary or "done"
                 run.completed = True
                 run.steps.append(StepRecord(kind="final", content=run.final_summary))
+                # Break early: don't execute remaining pending calls after finish succeeds.
+                break
 
         observation = "\n".join(
             format_tool_result(r.name, r.call_id, r.output, r.error) for r in tool_results
         )
-        state["messages"].append(HumanMessage(content=f"Tool results:\n{observation}"))
+        # FIX #5: Return message updates instead of mutating state in place.
+        state["messages"] = [HumanMessage(content=f"Tool results:\n{observation}")]
         state["pending_calls"] = []
         return state
 
@@ -232,13 +262,19 @@ class AgentGraph:
             return "reason"
         if state.get("pending_calls"):
             return "act"
+        # NOTE: Unreachable under normal conditions—_reason always sets completed, errored,
+        # retry_reason, or pending_calls before returning. Kept for defensive robustness.
         return "end"
 
     def _route_after_act(self, state: _AgentState) -> str:
         run = state["run"]
         if run.completed or run.errored:
             return "end"
-        if state["turn"] >= self.max_steps:
+        # FIX #3: Check work_turn, not turn. Retries are free, so they don't count against limit.
+        # NOTE: Step limit is enforced here (after tools execute), so the final work_turn
+        # still gets its tools run before the limit trip. This is intentional—allow each
+        # planned turn to complete, then check if we're out of budget for the next.
+        if state["work_turn"] >= self.max_steps:
             run.step_limit_hit = True
             run.steps.append(
                 StepRecord(
@@ -250,7 +286,8 @@ class AgentGraph:
         return "reason"
 
     def _should_retry_false_tool_refusal(self, content: str, state: _AgentState) -> bool:
-        if state.get("tool_refusal_retried") or state["turn"] >= self.max_steps:
+        # FIX #2/#3: Use work_turn for limit (retries are free). Use > not >= for final turn.
+        if state.get("tool_refusal_retried") or state["work_turn"] > self.max_steps:
             return False
         lowered = content.lower()
         refusal_markers = (
@@ -264,18 +301,22 @@ class AgentGraph:
         return bool(self.registry.names()) and any(marker in lowered for marker in refusal_markers)
 
     def _should_retry_empty_response(self, content: str, state: _AgentState) -> bool:
-        if state.get("empty_response_retried") or state["turn"] >= self.max_steps:
+        # FIX #2/#3: Use work_turn for limit (retries are free). Use > not >= for final turn.
+        if state.get("empty_response_retried") or state["work_turn"] > self.max_steps:
             return False
         return not content.strip()
 
     def _required_tool_retry_hint(self, goal: str, state: _AgentState) -> str | None:
-        if state.get("required_tool_retried") or state["turn"] >= self.max_steps:
+        # FIX #2/#3: Use work_turn for limit (retries are free). Use > not >= for final turn.
+        if state.get("required_tool_retried") or state["work_turn"] > self.max_steps:
             return None
         return self._goal_tool_hint(goal, retry=True, metadata=state["context"].metadata)
 
     def _goal_tool_hint(
         self, goal: str, *, retry: bool = False, metadata: dict | None = None
     ) -> str | None:
+        # FIX #6: Hardcoded heuristics for note and document tasks are domain-specific.
+        # Consider extracting to config/pluggable module if tools or domains change.
         lowered = goal.lower()
         tool_names = set(self.registry.names())
         uploaded_document_count = int((metadata or {}).get("uploaded_document_count") or 0)
@@ -341,4 +382,9 @@ class AgentGraph:
         content = message.content
         if isinstance(content, str):
             return content
+        # FIX #5: For multimodal content (list of dicts), serialize to JSON to avoid Python repr.
+        # Currently only str messages are created, but this protects against future multimodal parts.
+        if isinstance(content, list):
+            import json
+            return json.dumps(content)
         return str(content)
