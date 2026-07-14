@@ -82,11 +82,19 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools.keys())
 
+    def tools(self) -> list[Tool]:
+        return list(self._tools.values())
+
     def specs(self) -> list[ToolSpec]:
         return [tool.spec() for tool in self._tools.values()]
 
     async def invoke(
-        self, name: str, arguments: dict[str, Any], context: ToolContext, *, call_id: str | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        *,
+        call_id: str | None = None,
     ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:

@@ -51,3 +51,8 @@ async def test_registry_rejects_duplicate_registration():
     registry = ToolRegistry([_make_tool("dup", _echo)])
     with pytest.raises(ValueError):
         registry.register(_make_tool("dup", _echo))
+
+
+async def test_registry_tools_lists_registered():
+    registry = ToolRegistry([_make_tool("echo", _echo), _make_tool("boom", _boom)])
+    assert [t.name for t in registry.tools()] == ["echo", "boom"]

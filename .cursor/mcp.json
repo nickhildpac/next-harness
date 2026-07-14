@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "next-harness": {
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": ["-m", "app.mcp"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "MCP_USER_ID": "anonymous"
+      }
+    }
+  }
+}

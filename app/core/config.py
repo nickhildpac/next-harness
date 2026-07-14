@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     rag_token_budget: int = 1500  # cap on the retrieved-chunk share of the context budget
     rag_max_upload_bytes: int = 10 * 1024 * 1024
 
+    # Identity defaults for the stdio MCP tool server (`python -m app.mcp`).
+    mcp_user_id: str | None = None
+    mcp_task_id: str | None = None
+
     @field_validator("embedding_dimensions", mode="before")
     @classmethod
     def empty_dimensions_as_none(cls, value):
@@ -72,6 +76,13 @@ class Settings(BaseSettings):
     @field_validator("task_openai_model", mode="before")
     @classmethod
     def empty_task_openai_model_as_none(cls, value):
+        if value == "":
+            return None
+        return value
+
+    @field_validator("mcp_user_id", "mcp_task_id", mode="before")
+    @classmethod
+    def empty_mcp_identity_as_none(cls, value):
         if value == "":
             return None
         return value

@@ -145,6 +145,9 @@ Task/agent surface (primary):
 - `POST /tasks/{task_id}/run` — run a pending task after optional document uploads.
 - `GET /tasks?user_id=...`, `GET /tasks/{task_id}` — list and inspect runs.
 - `GET /tools` — introspect the registered tool set (name, description, JSON schema).
+- MCP stdio server: `python -m app.mcp` (Cursor: `.cursor/mcp.json`); tools mirror
+  `build_default_registry()` via `Tool.spec()`, excluding `finish`. Identity via
+  `MCP_USER_ID` / `MCP_TASK_ID` or per-call `user_id` / `task_id` args.
 
 Chat/notes/translations surface (secondary): `POST /conversations`, `GET /conversations/{id}`,
 `PATCH /conversations/{id}/tone`, `POST /conversations/{id}/messages?stream=true` (SSE),
