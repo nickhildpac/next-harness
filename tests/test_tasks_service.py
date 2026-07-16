@@ -34,8 +34,20 @@ class ScriptedLLM:
         return True
 
 
+def _service(session, llm, **kwargs) -> TaskService:
+    """In-memory SQLite cannot be shared with an MCP subprocess; use local tools."""
+    return TaskService(
+        session,
+        Settings(),
+        llm,
+        http_client=None,
+        use_mcp_tools=False,
+        **kwargs,
+    )
+
+
 async def test_tools_endpoint_lists_default_registry(session):
-    service = TaskService(session, Settings(), ScriptedLLM([]), http_client=None)
+    service = _service(session, ScriptedLLM([]))
     tools = service.available_tools()
     names = {t.name for t in tools}
     assert {
@@ -57,7 +69,7 @@ async def test_run_task_persists_run_and_steps(session):
             '<tool_call>{"name":"finish","arguments":{"summary":"time reported"}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
     detail = await service.create_task(
         TaskCreate(goal="Report the time", user_id="alice", max_steps=4)
     )
@@ -79,7 +91,7 @@ async def test_run_task_records_failure_on_step_limit(session):
             '<tool_call>{"name":"now","arguments":{}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
     detail = await service.create_task(
         TaskCreate(goal="Loop forever", user_id="alice", max_steps=2)
     )
@@ -89,7 +101,7 @@ async def test_run_task_records_failure_on_step_limit(session):
 
 async def test_run_task_records_failure_on_empty_model_response(session):
     llm = ScriptedLLM(["", "", ""])
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
 
     detail = await service.create_task(
         TaskCreate(
@@ -112,7 +124,7 @@ async def test_scoping_allowed_tools_hides_others(session):
             '<tool_call>{"name":"finish","arguments":{"summary":"listed"}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
     detail = await service.create_task(
         TaskCreate(
             goal="List notes", user_id="alice", max_steps=4, allowed_tools=["list_notes"]
@@ -125,7 +137,7 @@ async def test_scoping_allowed_tools_hides_others(session):
 
 
 async def test_scoping_allowed_tools_rejects_unknown_names(session):
-    service = TaskService(session, Settings(), ScriptedLLM([]), http_client=None)
+    service = _service(session, ScriptedLLM([]))
 
     with pytest.raises(Exception) as exc_info:
         await service.create_task(
@@ -143,7 +155,7 @@ async def test_agent_can_create_note_for_task_user(session):
             '<tool_call>{"name":"finish","arguments":{"summary":"note created"}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
 
     detail = await service.create_task(
         TaskCreate(goal="Create a note", user_id="alice", max_steps=4)
@@ -164,7 +176,7 @@ async def test_agent_can_translate_and_save_text(session):
             '<tool_call>{"name":"finish","arguments":{"summary":"translation saved"}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
 
     detail = await service.create_task(
         TaskCreate(goal="Translate hello", user_id="alice", max_steps=4)
@@ -188,11 +200,9 @@ async def test_agent_can_ingest_and_search_task_documents(session):
         ]
     )
     vectorstore = FakeVectorStore()
-    service = TaskService(
+    service = _service(
         session,
-        Settings(),
         llm,
-        http_client=None,
         embeddings=FakeEmbeddings(),
         vectorstore=vectorstore,
     )
@@ -223,11 +233,9 @@ async def test_agent_can_search_preuploaded_task_documents(session):
         ]
     )
     vectorstore = FakeVectorStore()
-    service = TaskService(
+    service = _service(
         session,
-        Settings(),
         llm,
-        http_client=None,
         embeddings=FakeEmbeddings(),
         vectorstore=vectorstore,
     )
@@ -274,7 +282,7 @@ async def test_list_tasks_scoped_by_user(session):
             '<tool_call>{"name":"finish","arguments":{"summary":"ok"}}</tool_call>',
         ]
     )
-    service = TaskService(session, Settings(), llm, http_client=None)
+    service = _service(session, llm)
     await service.create_task(TaskCreate(goal="A", user_id="alice"))
     await service.create_task(TaskCreate(goal="B", user_id="bob"))
     alice = await service.list_tasks("alice")

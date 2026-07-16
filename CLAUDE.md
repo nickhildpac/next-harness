@@ -51,12 +51,13 @@ routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
   assistant text — that fenced-JSON contract is how tools work with every adapter, no
   provider-native tool API required.
 - **`app/orchestration/agent_graph.py`** — LangGraph loop with two nodes: `reason` (LLM turn) →
-  `act` (dispatch tool calls) → `reason` again. Exits when the model emits `finish`, produces a
-  reply with no tool calls, or hits `max_steps`.
+  `act` (dispatch tool calls via `ToolInvoker`) → `reason` again. Exits when the model emits
+  `finish`, produces a reply with no tool calls, or hits `max_steps`. Production runs use an MCP
+  stdio client (`HybridToolInvoker`: local `finish`, other tools via `python -m app.mcp`).
 - **`app/orchestration/chat_graph.py`** — the older single-node LLM wrapper, retained for the chat
   surface.
 - **`app/services/tasks.py`** — `TaskService` creates an `AgentTask`, runs the loop against a
-  (optionally scoped) tool registry, persists every reason/act step as an `AgentTaskStep`, and
+  (optionally scoped) tool invoker, persists every reason/act step as an `AgentTaskStep`, and
   finalizes status (`completed`/`failed`).
 - **`app/services/conversations.py`** — chat orchestrator (persist user message, resolve tone,
   build context, run `ChatGraph` or stream, persist reply, summarize, commit). Still handles the
@@ -94,15 +95,17 @@ the OpenRouter model is set inside its adapter. Ollama is expected at `localhost
   model is instructed to emit tool calls as `<tool_call>{"name":..., "arguments":{...}}</tool_call>`
   blocks in its content. `parse_tool_calls` extracts them and treats the remaining text as visible
   reasoning (persisted as a `thought` step).
-- One loop iteration = one `reason` LLM turn plus zero-or-more tool calls executed by `act`. If the
-  model returns *no* tool calls, that turn's text becomes the final answer (`final` step). If it
-  calls the built-in `finish` tool, the run completes with `finish.summary` as `result_summary`.
+- One loop iteration = one `reason` LLM turn plus zero-or-more tool calls executed by `act` (via
+  MCP stdio for non-`finish` tools; `finish` is local). If the model returns *no* tool calls after
+  retries, the run errors (`model refused to call tools`). If it calls the built-in `finish` tool,
+  the run completes with `finish.summary` as `result_summary`.
 - `max_steps` (default 8, capped at 32) counts reason turns; hitting it marks the task `failed`
   with a step-limit error. Tool failures are surfaced back to the model as JSON error observations
   so it can recover on the next turn.
-- Tools receive a `ToolContext(session, http_client, user_id, metadata)`. Handlers that touch the DB
-  use the same session as the request, so their writes commit atomically with the run's step log.
-- `allowed_tools` on the task request narrows the registry for that run (the `finish` tool is
+- Tools receive a `ToolContext(session, http_client, user_id, metadata)`. MCP-backed tools get
+  `user_id`/`task_id` injected into the MCP call and run in the child process's own session;
+  handlers that touch the DB in the local-registry test path use the request session.
+- `allowed_tools` on the task request narrows the invoker for that run (the `finish` tool is
   always kept in scope). Omit it to expose everything the server registered.
 
 ### Conversation kinds

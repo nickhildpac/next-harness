@@ -9,8 +9,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, StateGraph, add_messages
 
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall
+from app.ports.tools import ToolInvoker
 from app.tools.protocol import format_tool_result, parse_tool_calls, render_tool_manifest
-from app.tools.registry import ToolContext, ToolRegistry, ToolResult
+from app.tools.registry import ToolContext, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,9 @@ class _AgentState(TypedDict, total=False):
 class AgentGraph:
     """LangGraph loop: reason → (optional) tool_calls → observe, repeated until done."""
 
-    def __init__(self, llm: LLMClient, registry: ToolRegistry, max_steps: int):
+    def __init__(self, llm: LLMClient, tools: ToolInvoker, max_steps: int):
         self.llm = llm
-        self.registry = registry
+        self.tools = tools
         self.max_steps = max_steps
         graph: StateGraph = StateGraph(_AgentState)
         graph.add_node("reason", self._reason)
@@ -95,7 +96,7 @@ class AgentGraph:
         self.graph = graph.compile()
 
     def system_prompt(self) -> str:
-        return f"{AGENT_SYSTEM_PREAMBLE}\n\n{render_tool_manifest(self.registry.specs())}"
+        return f"{AGENT_SYSTEM_PREAMBLE}\n\n{render_tool_manifest(self.tools.specs())}"
 
     async def run(
         self,
@@ -163,7 +164,7 @@ class AgentGraph:
                         content=(
                             "Correction: you do have access to the listed tools. "
                             "For this task, call the appropriate tool using a <tool_call> block. "
-                            f"Available tools: {', '.join(self.registry.names())}."
+                            f"Available tools: {', '.join(self.tools.names())}."
                         )
                     )
                 )
@@ -225,7 +226,7 @@ class AgentGraph:
                     payload={"arguments": call.arguments, "call_id": call.call_id},
                 )
             )
-            result = await self.registry.invoke(
+            result = await self.tools.invoke(
                 call.name, call.arguments, context, call_id=call.call_id
             )
             run.steps.append(
@@ -233,13 +234,21 @@ class AgentGraph:
                     kind="tool_result",
                     tool_name=result.name,
                     ok=result.ok,
-                    payload={"output": result.output, "error": result.error, "call_id": result.call_id},
+                    payload={
+                        "output": result.output,
+                        "error": result.error,
+                        "call_id": result.call_id,
+                    },
                 )
             )
             tool_results.append(result)
             # FIX #4: Short-circuit batch on successful finish to avoid wasted tool calls.
             if call.name == "finish" and result.ok:
-                summary = (result.output or {}).get("summary") if isinstance(result.output, dict) else None
+                summary = (
+                    (result.output or {}).get("summary")
+                    if isinstance(result.output, dict)
+                    else None
+                )
                 run.final_summary = summary or "done"
                 run.completed = True
                 run.steps.append(StepRecord(kind="final", content=run.final_summary))
@@ -298,7 +307,7 @@ class AgentGraph:
             "can't access",
             "cannot access",
         )
-        return bool(self.registry.names()) and any(marker in lowered for marker in refusal_markers)
+        return bool(self.tools.names()) and any(marker in lowered for marker in refusal_markers)
 
     def _should_retry_empty_response(self, content: str, state: _AgentState) -> bool:
         # FIX #2/#3: Use work_turn for limit (retries are free). Use > not >= for final turn.
@@ -318,7 +327,7 @@ class AgentGraph:
         # FIX #6: Hardcoded heuristics for note and document tasks are domain-specific.
         # Consider extracting to config/pluggable module if tools or domains change.
         lowered = goal.lower()
-        tool_names = set(self.registry.names())
+        tool_names = set(self.tools.names())
         uploaded_document_count = int((metadata or {}).get("uploaded_document_count") or 0)
         if uploaded_document_count and {"list_task_documents", "search_task_documents"}.issubset(
             tool_names
@@ -341,7 +350,9 @@ class AgentGraph:
             return None
 
         asks_for_summary = any(word in lowered for word in ("summarize", "summary", "summarise"))
-        asks_to_create = any(phrase in lowered for phrase in ("create", "new one", "new note", "save"))
+        asks_to_create = any(
+            phrase in lowered for phrase in ("create", "new one", "new note", "save")
+        )
         asks_for_recent = any(word in lowered for word in ("last", "recent", "latest"))
         if not (asks_for_summary and asks_to_create and asks_for_recent):
             return None
@@ -386,5 +397,6 @@ class AgentGraph:
         # Currently only str messages are created, but this protects against future multimodal parts.
         if isinstance(content, list):
             import json
+
             return json.dumps(content)
         return str(content)

@@ -22,12 +22,12 @@ class Settings(BaseSettings):
     auth_token_ttl_minutes: int = 60 * 24
     auth_allow_signup: bool = True
 
-    llm_provider: Literal[
-        "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"
-    ] = "openrouter"
-    task_llm_provider: Literal[
-        "openrouter", "ollama", "auto", "openai", "anthropic", "gemini"
-    ] = "openai"
+    llm_provider: Literal["openrouter", "ollama", "auto", "openai", "anthropic", "gemini"] = (
+        "openrouter"
+    )
+    task_llm_provider: Literal["openrouter", "ollama", "auto", "openai", "anthropic", "gemini"] = (
+        "openai"
+    )
     ollama_base_url: AnyHttpUrl = "http://localhost:11434"
     openrouter_base_url: AnyHttpUrl = "https://openrouter.ai/api/v1"
     openrouter_api_key: str | None = None
@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # Identity defaults for the stdio MCP tool server (`python -m app.mcp`).
     mcp_user_id: str | None = None
     mcp_task_id: str | None = None
+    # AgentGraph MCP client: spawn command/cwd for the stdio subprocess.
+    # When unset, defaults to ``[sys.executable, "-m", "app.mcp"]``.
+    mcp_server_command: list[str] | None = None
+    mcp_server_cwd: str | None = None
 
     @field_validator("embedding_dimensions", mode="before")
     @classmethod
@@ -80,10 +84,17 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("mcp_user_id", "mcp_task_id", mode="before")
+    @field_validator("mcp_user_id", "mcp_task_id", "mcp_server_cwd", mode="before")
     @classmethod
     def empty_mcp_identity_as_none(cls, value):
         if value == "":
+            return None
+        return value
+
+    @field_validator("mcp_server_command", mode="before")
+    @classmethod
+    def empty_mcp_server_command_as_none(cls, value):
+        if value == "" or value == []:
             return None
         return value
 

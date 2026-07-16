@@ -73,13 +73,15 @@ async def test_agent_completes_with_finish_tool():
     assert kinds == ["thought", "tool_call", "tool_result", "tool_call", "tool_result", "final"]
 
 
-async def test_agent_treats_no_tool_call_as_final_answer():
+async def test_agent_treats_no_tool_call_as_error():
     llm = ScriptedLLM(["Nothing needed, the goal is already met."])
     graph = AgentGraph(llm, await _registry(), max_steps=3)
     run = await graph.run("say hi", _params(), ToolContext())
-    assert run.completed is True
-    assert "goal is already met" in run.final_summary
-    assert run.steps[-1].kind == "final"
+    assert run.completed is False
+    assert run.errored is True
+    assert run.error == "model refused to call tools"
+    assert run.steps[-1].kind == "error"
+    assert "goal is already met" in (run.final_summary or "")
 
 
 async def test_agent_retries_empty_response_then_fails_explicitly():

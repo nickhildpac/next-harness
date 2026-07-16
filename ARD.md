@@ -20,10 +20,16 @@ trace of reasoning, tool calls, tool observations, and final output.
 Task agents use the provider-neutral `<tool_call>{...}</tool_call>` text protocol as the primary
 tool-calling contract. `app/tools/protocol.py` renders the tool manifest into the system prompt and
 parses assistant output. `app/orchestration/agent_graph.py` drives the reason/act loop and dispatches
-parsed calls through `ToolRegistry`.
+parsed calls through a `ToolInvoker` port.
+
+In production, `TaskService` opens an MCP stdio client against `python -m app.mcp` and uses
+`HybridToolInvoker`: non-`finish` tools run in the MCP subprocess (own DB session via
+`McpRuntime`); `finish` stays local so the agent can complete without exposing control flow over
+MCP. `ToolRegistry` remains the MCP server backend and the fast local invoker used in unit tests
+(`use_mcp_tools=False`).
 
 Native provider tool APIs can be added later as adapter-level optimizations, but they should preserve
-the same `ToolRegistry`, task step trace, and error observation behavior.
+the same invoker contract, task step trace, and error observation behavior.
 
 ### Consequences
 
@@ -32,7 +38,10 @@ the same `ToolRegistry`, task step trace, and error observation behavior.
 - The model can produce malformed text or no tool call. Current mitigations live in
   `AgentGraph`: explicit tool-use prompting, empty-response retries, false-refusal retry text, and
   structured tool error observations.
-- Future native-tool support must not bypass task step persistence or the registry permission model.
+- Future native-tool support must not bypass task step persistence or the allowed-tools permission
+  model.
+- MCP process boundary means tool writes no longer share the request session/transaction with task
+  step persistence.
 
 ## ADR-002: Task Documents Are First-Class Attachments
 
