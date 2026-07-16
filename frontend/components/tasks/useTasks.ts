@@ -1,9 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, readSse, responseErrorMessage } from "@/lib/api";
 import type { ApiOptions } from "@/lib/api";
-import type { Task, TaskDetail, ToolInfo } from "@/lib/types";
+import type { Task, TaskDetail, TaskStep, ToolInfo } from "@/lib/types";
 import { requiredToolsForTaskGoal } from "../CueApp.helpers";
 
 export type BackendApi = <T>(path: string, options?: ApiOptions) => Promise<T>;
@@ -12,6 +12,56 @@ type UseTasksOptions = {
   api: BackendApi;
   token: string | null;
 };
+
+async function streamTaskRun(
+  path: string,
+  options: {
+    token: string | null;
+    method?: string;
+    json?: unknown;
+    onTask: (task: TaskDetail) => void;
+    onStep: (step: TaskStep) => void;
+    onDone: (task: TaskDetail) => void;
+  }
+) {
+  const headers = new Headers();
+  if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
+  let body: BodyInit | undefined;
+  if (options.json !== undefined) {
+    headers.set("Content-Type", "application/json");
+    body = JSON.stringify(options.json);
+  }
+  const response = await fetch(`/api/backend${path}`, {
+    method: options.method || "POST",
+    headers,
+    body,
+    cache: "no-store"
+  });
+  if (!response.ok) throw new Error(await responseErrorMessage(response));
+  if (!response.body) throw new Error(`${response.status} ${response.statusText}`);
+
+  let streamError: string | null = null;
+  await readSse(response.body, (event) => {
+    if (event.data === "[DONE]") return;
+    const payload = JSON.parse(event.data) as Record<string, unknown>;
+    if (event.event === "error") {
+      streamError = String(payload.error || "Stream failed");
+      return;
+    }
+    if (event.event === "task") {
+      options.onTask(payload as unknown as TaskDetail);
+      return;
+    }
+    if (event.event === "step") {
+      options.onStep(payload as unknown as TaskStep);
+      return;
+    }
+    if (event.event === "done") {
+      options.onDone(payload as unknown as TaskDetail);
+    }
+  });
+  if (streamError) throw new Error(streamError);
+}
 
 export function useTasks({ api, token }: UseTasksOptions) {
   const [tools, setTools] = useState<ToolInfo[]>([]);
@@ -91,6 +141,29 @@ export function useTasks({ api, token }: UseTasksOptions) {
     setTaskFiles((current) => current.filter((_, currentIndex) => currentIndex !== index));
   }, []);
 
+  const applyStreamHandlers = useCallback(() => {
+    return {
+      onTask: (task: TaskDetail) => {
+        setActiveTaskId(task.id);
+        setActiveTask({ ...task, steps: task.steps || [] });
+      },
+      onStep: (step: TaskStep) => {
+        setActiveTask((current) =>
+          current
+            ? {
+                ...current,
+                steps: [...current.steps, step]
+              }
+            : current
+        );
+      },
+      onDone: (task: TaskDetail) => {
+        setActiveTaskId(task.id);
+        setActiveTask(task);
+      }
+    };
+  }, []);
+
   const runTask = useCallback(async () => {
     if (!taskGoal.trim()) return;
 
@@ -108,7 +181,7 @@ export function useTasks({ api, token }: UseTasksOptions) {
     try {
       const allowed = Array.from(selected);
       const allowedTools = tools.length === 0 || allowed.length === tools.length ? null : allowed;
-      let task: TaskDetail;
+      const handlers = applyStreamHandlers();
 
       if (taskFiles.length) {
         const pendingTask = await api<TaskDetail>("/tasks", {
@@ -131,27 +204,41 @@ export function useTasks({ api, token }: UseTasksOptions) {
           });
         }
 
-        task = await api<TaskDetail>(`/tasks/${pendingTask.id}/run`, { method: "POST" });
+        await streamTaskRun(`/tasks/${pendingTask.id}/run?stream=true`, {
+          token,
+          method: "POST",
+          ...handlers
+        });
       } else {
-        task = await api<TaskDetail>("/tasks", {
+        await streamTaskRun("/tasks?stream=true", {
+          token,
           method: "POST",
           json: {
             goal: taskGoal,
             max_steps: maxSteps,
             allowed_tools: allowedTools
-          }
+          },
+          ...handlers
         });
       }
 
       setTaskGoal("");
       setTaskFiles([]);
-      setActiveTaskId(task.id);
-      setActiveTask(task);
       await loadTasks();
     } finally {
       setTaskRunning(false);
     }
-  }, [api, loadTasks, maxSteps, selectedTools, taskFiles, taskGoal, token, tools]);
+  }, [
+    api,
+    applyStreamHandlers,
+    loadTasks,
+    maxSteps,
+    selectedTools,
+    taskFiles,
+    taskGoal,
+    token,
+    tools
+  ]);
 
   return {
     tools,

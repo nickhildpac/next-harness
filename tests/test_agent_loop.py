@@ -73,6 +73,69 @@ async def test_agent_completes_with_finish_tool():
     assert kinds == ["thought", "tool_call", "tool_result", "tool_call", "tool_result", "final"]
 
 
+async def test_agent_stream_emits_custom_steps_in_order():
+    from app.orchestration.agent_graph import StepRecord
+
+    llm = ScriptedLLM(
+        [
+            'Plan: echo then finish.\n<tool_call>{"name":"echo","arguments":{"x":1}}</tool_call>',
+            '<tool_call>{"name":"finish","arguments":{"summary":"echoed once"}}</tool_call>',
+        ]
+    )
+    graph = AgentGraph(llm, await _registry(), max_steps=5)
+    custom_kinds: list[str] = []
+    final_run = None
+    async for mode, chunk in graph.stream("test goal", _params(), ToolContext()):
+        if mode == "custom":
+            assert isinstance(chunk, StepRecord)
+            custom_kinds.append(chunk.kind)
+        elif mode == "values" and isinstance(chunk, dict) and "run" in chunk:
+            final_run = chunk["run"]
+
+    assert custom_kinds == [
+        "thought",
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "final",
+    ]
+    assert final_run is not None
+    assert final_run.completed is True
+    assert final_run.final_summary == "echoed once"
+    assert [s.kind for s in final_run.steps] == custom_kinds
+
+
+async def test_agent_stream_emits_mid_act_tools_before_node_ends():
+    """Two tools in one reason turn should stream as separate custom chunks mid-act."""
+    from app.orchestration.agent_graph import StepRecord
+
+    llm = ScriptedLLM(
+        [
+            (
+                '<tool_call>{"name":"echo","arguments":{"n":1}}</tool_call>\n'
+                '<tool_call>{"name":"echo","arguments":{"n":2}}</tool_call>\n'
+                '<tool_call>{"name":"finish","arguments":{"summary":"two echos"}}</tool_call>'
+            ),
+        ]
+    )
+    graph = AgentGraph(llm, await _registry(), max_steps=5)
+    custom_kinds: list[str] = []
+    async for mode, chunk in graph.stream("batch tools", _params(), ToolContext()):
+        if mode == "custom" and isinstance(chunk, StepRecord):
+            custom_kinds.append(chunk.kind)
+
+    assert custom_kinds == [
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "final",
+    ]
+
+
 async def test_agent_treats_no_tool_call_as_error():
     llm = ScriptedLLM(["Nothing needed, the goal is already met."])
     graph = AgentGraph(llm, await _registry(), max_steps=3)
@@ -121,7 +184,9 @@ async def test_agent_records_tool_failure_and_continues():
     graph = AgentGraph(llm, await _registry(), max_steps=5)
     run = await graph.run("try a missing tool", _params(), ToolContext())
     assert run.completed is True
-    tool_result_step = next(s for s in run.steps if s.kind == "tool_result" and s.tool_name == "missing")
+    tool_result_step = next(
+        s for s in run.steps if s.kind == "tool_result" and s.tool_name == "missing"
+    )
     assert tool_result_step.ok is False
     # The second LLM turn should have received the tool-result observation
     second_turn = llm.calls[1]
@@ -279,7 +344,9 @@ async def test_agent_notes_summary_empty_responses_do_not_complete_without_outpu
     assert run.completed is False
     assert run.errored is True
     assert run.error == "model returned an empty response without tool calls"
-    assert "First call list_notes with limit 3" in "\n".join(message.content for message in llm.calls[0])
+    assert "First call list_notes with limit 3" in "\n".join(
+        message.content for message in llm.calls[0]
+    )
     assert "Correction: this task requires note tools" in "\n".join(
         message.content for message in llm.calls[1]
     )

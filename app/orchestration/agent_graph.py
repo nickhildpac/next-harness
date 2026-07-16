@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph, add_messages
 
 from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall
@@ -98,12 +100,12 @@ class AgentGraph:
     def system_prompt(self) -> str:
         return f"{AGENT_SYSTEM_PREAMBLE}\n\n{render_tool_manifest(self.tools.specs())}"
 
-    async def run(
+    def _initial_state(
         self,
         goal: str,
         params: GenerationParams,
         context: ToolContext,
-    ) -> AgentRun:
+    ) -> tuple[AgentRun, _AgentState]:
         run = AgentRun(goal=goal)
         messages: list[BaseMessage] = [
             SystemMessage(content=self.system_prompt()),
@@ -125,6 +127,15 @@ class AgentGraph:
             "required_tool_retried": False,
             "empty_response_retried": False,
         }
+        return run, state
+
+    async def run(
+        self,
+        goal: str,
+        params: GenerationParams,
+        context: ToolContext,
+    ) -> AgentRun:
+        run, state = self._initial_state(goal, params, context)
         try:
             final_state = await self.graph.ainvoke(state)
         except Exception as exc:  # noqa: BLE001
@@ -133,6 +144,29 @@ class AgentGraph:
             run.error = f"{exc.__class__.__name__}: {exc}"
             return run
         return final_state["run"]
+
+    async def stream(
+        self,
+        goal: str,
+        params: GenerationParams,
+        context: ToolContext,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Yield ``(mode, chunk)`` from LangGraph ``astream`` (custom + values)."""
+        run, state = self._initial_state(goal, params, context)
+        try:
+            async for mode, chunk in self.graph.astream(state, stream_mode=["custom", "values"]):
+                yield mode, chunk
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("agent_stream_failed", extra={"goal": goal})
+            run.errored = True
+            run.error = f"{exc.__class__.__name__}: {exc}"
+            yield "values", {"run": run}
+
+    @staticmethod
+    def _emit_step(run: AgentRun, step: StepRecord) -> StepRecord:
+        run.steps.append(step)
+        get_stream_writer()(step)
+        return step
 
     async def _reason(self, state: _AgentState) -> _AgentState:
         run = state["run"]
@@ -153,7 +187,7 @@ class AgentGraph:
         # FIX #5: Return message updates instead of mutating state in place.
         messages_to_add: list[BaseMessage] = [AIMessage(content=content)]
         if parsed.thought:
-            run.steps.append(StepRecord(kind="thought", content=parsed.thought))
+            self._emit_step(run, StepRecord(kind="thought", content=parsed.thought))
 
         if not parsed.tool_calls:
             if self._should_retry_false_tool_refusal(content, state):
@@ -194,7 +228,7 @@ class AgentGraph:
             if not content.strip():
                 run.errored = True
                 run.error = "model returned an empty response without tool calls"
-                run.steps.append(StepRecord(kind="error", content=run.error))
+                self._emit_step(run, StepRecord(kind="error", content=run.error))
                 state["pending_calls"] = []
                 state["messages"] = messages_to_add
                 return state
@@ -204,7 +238,7 @@ class AgentGraph:
             run.final_summary = summary
             run.errored = True
             run.error = "model refused to call tools"
-            run.steps.append(StepRecord(kind="error", content=f"Model refusal: {summary}"))
+            self._emit_step(run, StepRecord(kind="error", content=f"Model refusal: {summary}"))
             state["pending_calls"] = []
             state["messages"] = messages_to_add
             return state
@@ -219,17 +253,19 @@ class AgentGraph:
         pending = state.get("pending_calls", [])
         tool_results: list[ToolResult] = []
         for call in pending:
-            run.steps.append(
+            self._emit_step(
+                run,
                 StepRecord(
                     kind="tool_call",
                     tool_name=call.name,
                     payload={"arguments": call.arguments, "call_id": call.call_id},
-                )
+                ),
             )
             result = await self.tools.invoke(
                 call.name, call.arguments, context, call_id=call.call_id
             )
-            run.steps.append(
+            self._emit_step(
+                run,
                 StepRecord(
                     kind="tool_result",
                     tool_name=result.name,
@@ -239,7 +275,7 @@ class AgentGraph:
                         "error": result.error,
                         "call_id": result.call_id,
                     },
-                )
+                ),
             )
             tool_results.append(result)
             # FIX #4: Short-circuit batch on successful finish to avoid wasted tool calls.
@@ -251,7 +287,7 @@ class AgentGraph:
                 )
                 run.final_summary = summary or "done"
                 run.completed = True
-                run.steps.append(StepRecord(kind="final", content=run.final_summary))
+                self._emit_step(run, StepRecord(kind="final", content=run.final_summary))
                 # Break early: don't execute remaining pending calls after finish succeeds.
                 break
 
@@ -261,6 +297,17 @@ class AgentGraph:
         # FIX #5: Return message updates instead of mutating state in place.
         state["messages"] = [HumanMessage(content=f"Tool results:\n{observation}")]
         state["pending_calls"] = []
+
+        # Emit step-limit here (not in the router) so custom stream clients see it.
+        if not run.completed and not run.errored and state["work_turn"] >= self.max_steps:
+            run.step_limit_hit = True
+            self._emit_step(
+                run,
+                StepRecord(
+                    kind="error",
+                    content=f"step limit ({self.max_steps}) reached before finish",
+                ),
+            )
         return state
 
     def _route_after_reason(self, state: _AgentState) -> str:
@@ -277,20 +324,7 @@ class AgentGraph:
 
     def _route_after_act(self, state: _AgentState) -> str:
         run = state["run"]
-        if run.completed or run.errored:
-            return "end"
-        # FIX #3: Check work_turn, not turn. Retries are free, so they don't count against limit.
-        # NOTE: Step limit is enforced here (after tools execute), so the final work_turn
-        # still gets its tools run before the limit trip. This is intentional—allow each
-        # planned turn to complete, then check if we're out of budget for the next.
-        if state["work_turn"] >= self.max_steps:
-            run.step_limit_hit = True
-            run.steps.append(
-                StepRecord(
-                    kind="error",
-                    content=f"step limit ({self.max_steps}) reached before finish",
-                )
-            )
+        if run.completed or run.errored or run.step_limit_hit:
             return "end"
         return "reason"
 

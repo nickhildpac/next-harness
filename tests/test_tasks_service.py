@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+import json
 
 import pytest
 from sqlalchemy import select
@@ -83,6 +84,51 @@ async def test_run_task_persists_run_and_steps(session):
     assert fetched.status == "completed"
 
 
+async def test_stream_run_yields_task_step_done_and_persists(session):
+    llm = ScriptedLLM(
+        [
+            'Plan: get time.\n<tool_call>{"name":"now","arguments":{}}</tool_call>',
+            '<tool_call>{"name":"finish","arguments":{"summary":"time reported"}}</tool_call>',
+        ]
+    )
+    service = _service(session, llm)
+    events: list[tuple[str, dict]] = []
+    async for frame in service.stream_create_and_run(
+        TaskCreate(goal="Report the time", user_id="alice", max_steps=4)
+    ):
+        if frame.startswith("data: [DONE]"):
+            events.append(("done_marker", {}))
+            continue
+        event_name = "message"
+        data = ""
+        for line in frame.strip().split("\n"):
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            if line.startswith("data:"):
+                data = line[5:].strip()
+        if data and data != "[DONE]":
+            events.append((event_name, json.loads(data)))
+
+    names = [name for name, _ in events]
+    assert names[0] == "task"
+    assert "step" in names
+    assert names[-2] == "done"
+    assert names[-1] == "done_marker"
+
+    steps = [payload for name, payload in events if name == "step"]
+    assert any(s.get("tool_name") == "now" for s in steps)
+    assert any(s.get("kind") == "final" for s in steps)
+
+    done = next(payload for name, payload in events if name == "done")
+    assert done["status"] == "completed"
+    assert done["result_summary"] == "time reported"
+    assert len(done["steps"]) == len(steps)
+
+    fetched = await service.get_task(done["id"])
+    assert fetched.status == "completed"
+    assert len(fetched.steps) == len(steps)
+
+
 async def test_run_task_records_failure_on_step_limit(session):
     llm = ScriptedLLM(
         [
@@ -126,9 +172,7 @@ async def test_scoping_allowed_tools_hides_others(session):
     )
     service = _service(session, llm)
     detail = await service.create_task(
-        TaskCreate(
-            goal="List notes", user_id="alice", max_steps=4, allowed_tools=["list_notes"]
-        )
+        TaskCreate(goal="List notes", user_id="alice", max_steps=4, allowed_tools=["list_notes"])
     )
     assert detail.status == "completed"
     system_prompt = llm.calls[0][0].content
@@ -186,7 +230,9 @@ async def test_agent_can_translate_and_save_text(session):
     row = await session.scalar(select(Translation).where(Translation.user_id == "alice"))
     assert row is not None
     assert row.target_language == "Spanish"
-    turn = await session.scalar(select(TranslationTurn).where(TranslationTurn.translation_id == row.id))
+    turn = await session.scalar(
+        select(TranslationTurn).where(TranslationTurn.translation_id == row.id)
+    )
     assert turn is not None
     assert turn.translated_text == "hola"
 

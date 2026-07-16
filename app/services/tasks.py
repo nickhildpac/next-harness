@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -8,11 +10,13 @@ from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.mcp_client import McpStdioSession
+from app.api.sse import sse_done, sse_event
 from app.core.config import Settings
 from app.db.models import AgentTask, TaskStatus, TaskStepKind
 from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import GenerationParams, LLMClient
+from app.ports.tools import ToolInvoker
 from app.ports.vectorstore import VectorStore
 from app.repositories.documents import DocumentRepository
 from app.repositories.tasks import TaskRepository
@@ -71,6 +75,18 @@ class TaskService:
             return await self._detail(task.id)
         return await self._run_task(task)
 
+    async def stream_create_and_run(self, payload: TaskCreate) -> AsyncIterator[str]:
+        """Create a task and stream the agent run as SSE frames."""
+        task = await self.repo.create(
+            user_id=payload.user_id,
+            goal=payload.goal,
+            max_steps=payload.max_steps,
+            allowed_tools=payload.allowed_tools,
+        )
+        await self.session.commit()
+        async for frame in self.stream_run(task):
+            yield frame
+
     async def run_task(self, task_id: str, user_id: str) -> TaskDetail:
         task = await self._task_for_user(task_id, user_id)
         if task.status != TaskStatus.pending.value:
@@ -79,6 +95,21 @@ class TaskService:
                 detail=f"Task cannot be run from status '{task.status}'.",
             )
         return await self._run_task(task)
+
+    async def stream_run_task(self, task_id: str, user_id: str) -> AsyncIterator[str]:
+        try:
+            task = await self._task_for_user(task_id, user_id)
+            if task.status != TaskStatus.pending.value:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Task cannot be run from status '{task.status}'.",
+                )
+        except HTTPException as exc:
+            yield sse_event("error", {"error": exc.detail})
+            yield sse_done()
+            return
+        async for frame in self.stream_run(task):
+            yield frame
 
     async def upload_task_document(self, task_id: str, user_id: str, document: TaskDocumentUpload):
         task = await self._task_for_user(task_id, user_id)
@@ -96,6 +127,85 @@ class TaskService:
         documents = await DocumentRepository(self.session).list_by_task(task.id)
         return documents[-1]
 
+    async def stream_run(self, task: AgentTask) -> AsyncIterator[str]:
+        """Run the agent loop, persisting and yielding each step as SSE."""
+        try:
+            self._validate_allowed_tools(task.allowed_tools)
+            uploaded_document_count = await self._task_document_count(task.id)
+            await self.repo.set_status(task, TaskStatus.running)
+            await self.session.commit()
+            yield sse_event(
+                "task",
+                {
+                    **TaskResponse.model_validate(task).model_dump(mode="json"),
+                    "steps": [],
+                },
+            )
+
+            context = self._tool_context(task, uploaded_document_count=uploaded_document_count)
+            final_run: AgentRun | None = None
+            step_index = 0
+
+            async with self._tool_invoker(task) as invoker:
+                graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
+                async for mode, chunk in graph.stream(task.goal, self._params(), context):
+                    if mode == "custom" and isinstance(chunk, StepRecord):
+                        row = await self.repo.add_step(
+                            task,
+                            step_index=step_index,
+                            kind=self._step_kind(chunk),
+                            tool_name=chunk.tool_name,
+                            content=chunk.content,
+                            payload=chunk.payload,
+                            ok=chunk.ok,
+                        )
+                        step_index += 1
+                        await self.session.commit()
+                        yield sse_event(
+                            "step",
+                            TaskStepResponse.model_validate(row).model_dump(mode="json"),
+                        )
+                    elif mode == "values" and isinstance(chunk, dict) and "run" in chunk:
+                        final_run = chunk["run"]
+
+            if final_run is None:
+                final_run = AgentRun(
+                    goal=task.goal,
+                    errored=True,
+                    error="run ended without a result",
+                )
+
+            await self._finalize_run_status(task, final_run)
+            await self.session.commit()
+            detail = await self._detail(task.id)
+            yield sse_event("done", detail.model_dump(mode="json"))
+            yield sse_done()
+            logger.info(
+                "task_run_completed",
+                extra={
+                    "task_id": task.id,
+                    "status": task.status,
+                    "turns_used": final_run.turns_used,
+                    "step_limit_hit": final_run.step_limit_hit,
+                },
+            )
+        except HTTPException as exc:
+            await self.session.rollback()
+            yield sse_event("error", {"error": exc.detail})
+            yield sse_done()
+        except Exception as exc:  # noqa: BLE001
+            await self.session.rollback()
+            logger.exception("task_stream_failed", extra={"task_id": getattr(task, "id", None)})
+            try:
+                await self.repo.set_status(
+                    task, TaskStatus.failed, error=f"{exc.__class__.__name__}: {exc}"
+                )
+                await self.session.commit()
+            except Exception:  # noqa: BLE001
+                await self.session.rollback()
+            yield sse_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
+            yield sse_done()
+
     async def _run_task(self, task: AgentTask) -> TaskDetail:
         self._validate_allowed_tools(task.allowed_tools)
         uploaded_document_count = await self._task_document_count(task.id)
@@ -103,10 +213,9 @@ class TaskService:
         await self.session.commit()
 
         context = self._tool_context(task, uploaded_document_count=uploaded_document_count)
-        if self.use_mcp_tools:
-            run = await self._run_with_mcp(task, context)
-        else:
-            run = await self._run_with_local_registry(task, context)
+        async with self._tool_invoker(task) as invoker:
+            graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
+            run = await graph.run(task.goal, self._params(), context)
 
         await self._persist_run(task, run)
         await self.session.commit()
@@ -121,20 +230,17 @@ class TaskService:
         )
         return await self._detail(task.id)
 
-    async def _run_with_mcp(self, task: AgentTask, context: ToolContext) -> AgentRun:
-        async with McpStdioSession.from_settings(
-            self.settings,
-            user_id=task.user_id,
-            task_id=task.id,
-        ) as mcp:
-            invoker = await HybridToolInvoker.create(mcp, allowed_tools=task.allowed_tools)
-            graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
-            return await graph.run(task.goal, self._params(), context)
-
-    async def _run_with_local_registry(self, task: AgentTask, context: ToolContext) -> AgentRun:
-        registry = self._scoped_registry(task.allowed_tools)
-        graph = AgentGraph(self.llm, registry, max_steps=task.max_steps)
-        return await graph.run(task.goal, self._params(), context)
+    @asynccontextmanager
+    async def _tool_invoker(self, task: AgentTask) -> AsyncIterator[ToolInvoker]:
+        if self.use_mcp_tools:
+            async with McpStdioSession.from_settings(
+                self.settings,
+                user_id=task.user_id,
+                task_id=task.id,
+            ) as mcp:
+                yield await HybridToolInvoker.create(mcp, allowed_tools=task.allowed_tools)
+        else:
+            yield self._scoped_registry(task.allowed_tools)
 
     def _tool_context(self, task: AgentTask, *, uploaded_document_count: int) -> ToolContext:
         # MCP tools open their own DB session in the child process; local registry
@@ -213,6 +319,9 @@ class TaskService:
                 payload=step.payload,
                 ok=step.ok,
             )
+        await self._finalize_run_status(task, run)
+
+    async def _finalize_run_status(self, task: AgentTask, run: AgentRun) -> None:
         await self.repo.bump_steps(task, run.turns_used)
         if run.errored:
             await self.repo.set_status(task, TaskStatus.failed, error=run.error, model=run.model)

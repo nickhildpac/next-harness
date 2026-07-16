@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from app.api.dependencies import get_current_user, get_task_service
 from app.db.models import User
@@ -12,10 +13,16 @@ router = APIRouter(tags=["tasks"])
 @router.post("/tasks", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
 async def create_task(
     payload: TaskCreate,
+    stream: bool = Query(default=False),
     current_user: User = Depends(get_current_user),
     service: TaskService = Depends(get_task_service),
-) -> TaskDetail:
+):
     payload = payload.model_copy(update={"user_id": current_user.id})
+    if stream and payload.run:
+        return StreamingResponse(
+            service.stream_create_and_run(payload),
+            media_type="text/event-stream",
+        )
     return await service.create_task(payload)
 
 
@@ -58,9 +65,15 @@ async def upload_task_document(
 @router.post("/tasks/{task_id}/run", response_model=TaskDetail)
 async def run_task(
     task_id: str,
+    stream: bool = Query(default=False),
     current_user: User = Depends(get_current_user),
     service: TaskService = Depends(get_task_service),
-) -> TaskDetail:
+):
+    if stream:
+        return StreamingResponse(
+            service.stream_run_task(task_id, current_user.id),
+            media_type="text/event-stream",
+        )
     return await service.run_task(task_id, current_user.id)
 
 
