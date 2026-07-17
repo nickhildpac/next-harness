@@ -204,4 +204,45 @@ async def get_task_service(
     vectorstore: VectorStore = Depends(get_vector_store),
 ) -> AsyncIterator[TaskService]:
     http_client = getattr(request.app.state, "http_client", None)
-    yield TaskService(session, settings, llm, http_client, embeddings, vectorstore)
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    mcp_auth_token = token if scheme.lower() == "bearer" and token else None
+    if not mcp_auth_token:
+        mcp_auth_token = settings.mcp_http_auth_token
+
+    mcp_http_client: httpx.AsyncClient | None = None
+    transport = getattr(request.app.state, "mcp_asgi_transport", None)
+    streamable_url = settings.mcp_streamable_url.lower()
+    use_in_process_mcp = (
+        transport is not None
+        and settings.mcp_transport == "streamable_http"
+        and any(host in streamable_url for host in ("127.0.0.1", "localhost", "mcp.local"))
+    )
+    if use_in_process_mcp:
+        headers = {}
+        if mcp_auth_token:
+            headers["Authorization"] = f"Bearer {mcp_auth_token}"
+        mcp_http_client = httpx.AsyncClient(
+            transport=transport,
+            base_url="http://mcp.local",
+            headers=headers,
+            timeout=60.0,
+        )
+        # Point the MCP client at the in-process mount regardless of env port.
+        settings = settings.model_copy(update={"mcp_streamable_url": "http://mcp.local/mcp/"})
+
+    try:
+        yield TaskService(
+            session,
+            settings,
+            llm,
+            http_client,
+            embeddings,
+            vectorstore,
+            mcp_auth_token=mcp_auth_token,
+            mcp_http_client=mcp_http_client,
+        )
+    finally:
+        if mcp_http_client is not None:
+            await mcp_http_client.aclose()
+

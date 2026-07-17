@@ -2,70 +2,84 @@
 
 import { useMemo } from "react";
 import { marked } from "marked";
-import type { TaskDetail } from "@/lib/types";
+import type { AgentThreadDetail, TaskDetail } from "@/lib/types";
 import { escapeHtml, sanitizeMarkdownHtml, taskStepDetail, taskStepLabel } from "../CueApp.helpers";
 import styles from "../CueApp.module.css";
 
 type TaskTraceProps = {
-  activeTask: TaskDetail | null;
+  activeThread: AgentThreadDetail | null;
 };
 
-export function TaskTrace({ activeTask }: TaskTraceProps) {
-  const summaryText = activeTask?.result_summary || activeTask?.error || activeTask?.goal || "";
-
-  const summaryHtml = useMemo(() => {
-    if (!summaryText) return "";
-    try {
-      const result = marked.parse(summaryText);
-      return typeof result === "string" ? sanitizeMarkdownHtml(result) : escapeHtml(summaryText);
-    } catch {
-      return escapeHtml(summaryText);
-    }
-  }, [summaryText]);
-
-  if (!activeTask) {
-    return <div className={styles.empty}>Enter a goal and press Run task, or select a past task.</div>;
+export function TaskTrace({ activeThread }: TaskTraceProps) {
+  if (!activeThread) {
+    return <div className={styles.empty}>Enter a goal to start a thread, or select a past thread.</div>;
   }
 
-  const lastStep = activeTask.steps.at(-1) ?? null;
-  const latestStep = lastStep?.kind === "final" ? null : lastStep;
+  return (
+    <div className={styles.messages}>
+      {activeThread.tasks.map((task) => (
+        <TaskRunTrace key={task.id} task={task} />
+      ))}
+    </div>
+  );
+}
+
+function TaskRunTrace({ task }: { task: TaskDetail }) {
+  const isRunning = task.status === "running" || task.status === "pending";
+  const resultText = task.result_summary || task.error || "";
+  const resultHtml = useMemo(() => {
+    if (!resultText) return "";
+    try {
+      const result = marked.parse(resultText);
+      return typeof result === "string" ? sanitizeMarkdownHtml(result) : escapeHtml(resultText);
+    } catch {
+      return escapeHtml(resultText);
+    }
+  }, [resultText]);
+
+  const activitySteps = task.steps.filter(
+    (step) => step.kind === "tool_call" || step.kind === "tool_result"
+  );
 
   return (
-    <div className={styles.formStack}>
-      <div className={styles.card}>
-        <strong>{activeTask.status}</strong>
-        <div className={styles.taskMeta}>
-          <span>{activeTask.steps_taken} reason turn(s)</span>
-          <span>max {activeTask.max_steps}</span>
-          <span>{activeTask.model || "model unknown"}</span>
-          <span>tools: {activeTask.allowed_tools?.length ? activeTask.allowed_tools.join(", ") : "all registered"}</span>
+    <>
+      <div className={`${styles.messageRow} ${styles.messageMine}`}>
+        <div className={`${styles.messageStack} ${styles.messageStackMine}`}>
+          <div className={styles.sender}>You</div>
+          <div className={`${styles.bubble} ${styles.bubbleMine}`}>{task.goal}</div>
         </div>
-        <div className={styles.markdownBody} dangerouslySetInnerHTML={{ __html: summaryHtml }} />
       </div>
-      {latestStep ? (
-        <div
-          key={latestStep.id}
-          className={`${styles.taskStep} ${
-            latestStep.kind === "final"
-              ? styles.taskStepFinal
-              : latestStep.kind === "error" || latestStep.ok === false
-                ? styles.taskStepError
-                : ""
-          }`}
-        >
-          <div className={styles.taskStepHeader}>
-            <span className={styles.taskStepIndex}>#{latestStep.step_index}</span>
-            <strong>{taskStepLabel(latestStep)}</strong>
-            {taskStepDetail(latestStep) ? <span>{taskStepDetail(latestStep)}</span> : null}
-            {latestStep.ok !== null ? (
-              <span className={latestStep.ok ? styles.taskStepOk : styles.taskStepFailed}>
-                {latestStep.ok ? "ok" : "failed"}
-              </span>
-            ) : null}
-          </div>
-          {latestStep.content ? <p>{latestStep.content}</p> : null}
+      <div className={`${styles.messageRow} ${styles.messageOther}`}>
+        <div className={`${styles.messageStack} ${styles.messageStackOther}`}>
+          <div className={styles.sender}>Agent</div>
+          {isRunning ? (
+            <div className={styles.taskActivity}>
+              {activitySteps.map((step) => (
+                <div
+                  key={step.id}
+                  className={`${styles.taskActivityRow} ${
+                    step.ok === false ? styles.taskActivityFailed : ""
+                  }`}
+                >
+                  <span className={styles.taskActivityLabel}>{taskStepLabel(step)}</span>
+                  <span>{taskStepDetail(step) || step.tool_name || ""}</span>
+                </div>
+              ))}
+              <div className={styles.taskActivityRow}>
+                <span>Working...</span>
+                <span className={styles.cursor} />
+              </div>
+            </div>
+          ) : resultHtml ? (
+            <div
+              className={`${styles.bubble} ${styles.markdownBody}`}
+              dangerouslySetInnerHTML={{ __html: resultHtml }}
+            />
+          ) : (
+            <div className={styles.bubble}>No result produced.</div>
+          )}
         </div>
-      ) : null}
-    </div>
+      </div>
+    </>
   );
 }

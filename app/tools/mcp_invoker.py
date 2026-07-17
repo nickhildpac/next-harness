@@ -1,4 +1,4 @@
-"""Hybrid tool invoker: local ``finish`` + MCP stdio for everything else."""
+"""Hybrid tool invoker: local ``finish`` + MCP transport for everything else."""
 
 from __future__ import annotations
 

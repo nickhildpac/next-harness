@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class TaskCreate(BaseModel):
     goal: str = Field(min_length=1, max_length=4000)
     user_id: str = Field(default="anonymous", min_length=1, max_length=128)
+    thread_id: str | None = None
     max_steps: int = Field(default=8, ge=1, le=32)
     allowed_tools: list[str] | None = None
     run: bool = True
@@ -31,6 +32,10 @@ class TaskCreate(BaseModel):
         return cleaned or None
 
 
+class ThreadCreate(TaskCreate):
+    title: str | None = Field(default=None, max_length=255)
+
+
 class TaskStepResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -49,6 +54,8 @@ class TaskResponse(BaseModel):
 
     id: str
     user_id: str
+    thread_id: str | None = None
+    sequence_index: int
     goal: str
     status: str
     max_steps: int
@@ -63,6 +70,21 @@ class TaskResponse(BaseModel):
 
 class TaskDetail(TaskResponse):
     steps: list[TaskStepResponse] = Field(default_factory=list)
+
+
+class ThreadResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: str
+    title: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    tasks: list[TaskResponse] = Field(default_factory=list)
+
+
+class ThreadDetail(ThreadResponse):
+    tasks: list[TaskDetail] = Field(default_factory=list)
 
 
 class ToolInfo(BaseModel):

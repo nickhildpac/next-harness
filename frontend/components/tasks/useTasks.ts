@@ -1,9 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, readSse, responseErrorMessage } from "@/lib/api";
+import { apiFetch, responseErrorMessage } from "@/lib/api";
 import type { ApiOptions } from "@/lib/api";
-import type { Task, TaskDetail, TaskStep, ToolInfo } from "@/lib/types";
+import type {
+  AgentThread,
+  AgentThreadDetail,
+  TaskDetail,
+  TaskStep,
+  ToolInfo
+} from "@/lib/types";
 import { requiredToolsForTaskGoal } from "../CueApp.helpers";
 
 export type BackendApi = <T>(path: string, options?: ApiOptions) => Promise<T>;
@@ -41,75 +47,124 @@ async function streamTaskRun(
   if (!response.body) throw new Error(`${response.status} ${response.statusText}`);
 
   let streamError: string | null = null;
-  await readSse(response.body, (event) => {
-    if (event.data === "[DONE]") return;
-    const payload = JSON.parse(event.data) as Record<string, unknown>;
+  await readNdjson(response.body, (event) => {
     if (event.event === "error") {
+      const payload = event.data as { error?: unknown };
       streamError = String(payload.error || "Stream failed");
       return;
     }
     if (event.event === "task") {
-      options.onTask(payload as unknown as TaskDetail);
+      options.onTask(event.data as TaskDetail);
       return;
     }
     if (event.event === "step") {
-      options.onStep(payload as unknown as TaskStep);
+      options.onStep(event.data as TaskStep);
       return;
     }
     if (event.event === "done") {
-      options.onDone(payload as unknown as TaskDetail);
+      options.onDone(event.data as TaskDetail);
     }
   });
   if (streamError) throw new Error(streamError);
 }
 
+async function readNdjson(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: { event: string; data: unknown }) => void
+) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parsed = JSON.parse(trimmed) as { event?: string; data?: unknown };
+      onEvent({ event: parsed.event || "message", data: parsed.data });
+    }
+    if (done) break;
+  }
+
+  if (buffer.trim()) {
+    const parsed = JSON.parse(buffer.trim()) as { event?: string; data?: unknown };
+    onEvent({ event: parsed.event || "message", data: parsed.data });
+  }
+}
+
 export function useTasks({ api, token }: UseTasksOptions) {
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [selectedTools, setSelectedTools] = useState<Set<string>>(new Set());
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
-  const [activeTask, setActiveTask] = useState<TaskDetail | null>(null);
+  const [threads, setThreads] = useState<AgentThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activeThread, setActiveThread] = useState<AgentThreadDetail | null>(null);
   const [taskGoal, setTaskGoal] = useState("");
   const [taskFiles, setTaskFiles] = useState<File[]>([]);
   const [maxSteps, setMaxSteps] = useState(8);
   const [taskRunning, setTaskRunning] = useState(false);
+  const [taskError, setTaskError] = useState("");
 
   const resetTasks = useCallback(() => {
     setTools([]);
     setSelectedTools(new Set());
-    setTasks([]);
-    setActiveTaskId(null);
-    setActiveTask(null);
+    setThreads([]);
+    setActiveThreadId(null);
+    setActiveThread(null);
     setTaskGoal("");
     setTaskFiles([]);
     setMaxSteps(8);
     setTaskRunning(false);
+    setTaskError("");
   }, []);
 
   useEffect(() => {
     if (!token) resetTasks();
   }, [resetTasks, token]);
 
-  const loadTasks = useCallback(async () => {
-    const [toolRows, taskRows] = await Promise.all([api<ToolInfo[]>("/tools"), api<Task[]>("/tasks")]);
+  const loadThreads = useCallback(async () => {
+    const [toolRows, threadRows] = await Promise.all([
+      api<ToolInfo[]>("/tools"),
+      api<AgentThread[]>("/threads")
+    ]);
     setTools(toolRows);
     setSelectedTools((current) => (current.size ? current : new Set(toolRows.map((tool) => tool.name))));
-    setTasks(taskRows);
+    setThreads(threadRows);
   }, [api]);
 
-  const selectTask = useCallback(
+  const selectThread = useCallback(
     async (id: string) => {
-      setActiveTaskId(id);
-      const task = await api<TaskDetail>(`/tasks/${id}`);
-      setActiveTask(task);
+      setActiveThreadId(id);
+      const thread = await api<AgentThreadDetail>(`/threads/${id}`);
+      setActiveThread(thread);
     },
     [api]
   );
 
-  const startNewTask = useCallback(() => {
-    setActiveTaskId(null);
-    setActiveTask(null);
+  const deleteThread = useCallback(
+    async (id: string) => {
+      if (!window.confirm("Delete this agent thread? This cannot be undone.")) return;
+      await api<void>(`/threads/${id}`, { method: "DELETE" });
+      setThreads((current) => current.filter((thread) => thread.id !== id));
+      if (activeThreadId === id) {
+        setActiveThreadId(null);
+        setActiveThread(null);
+        setTaskGoal("");
+        setTaskFiles([]);
+      }
+    },
+    [activeThreadId, api]
+  );
+
+  const startNewThread = useCallback(() => {
+    setActiveThreadId(null);
+    setActiveThread(null);
+    setTaskGoal("");
     setTaskFiles([]);
+    setTaskError("");
   }, []);
 
   const selectAllTools = useCallback(() => {
@@ -142,25 +197,57 @@ export function useTasks({ api, token }: UseTasksOptions) {
   }, []);
 
   const applyStreamHandlers = useCallback(() => {
+    let streamedTaskId: string | null = null;
+    let streamedThreadId: string | null = null;
+
+    const upsertTask = (task: TaskDetail) => {
+      if (!task.thread_id) return;
+      streamedTaskId = task.id;
+      streamedThreadId = task.thread_id;
+      setActiveThreadId(task.thread_id);
+      setActiveThread((current) => {
+        if (!current || current.id !== task.thread_id) {
+          return {
+            id: task.thread_id!,
+            user_id: task.user_id,
+            title: task.goal,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            tasks: [task]
+          };
+        }
+        const exists = current.tasks.some((item) => item.id === task.id);
+        return {
+          ...current,
+          updated_at: task.updated_at,
+          tasks: exists
+            ? current.tasks.map((item) => (item.id === task.id ? task : item))
+            : [...current.tasks, task]
+        };
+      });
+    };
+
     return {
       onTask: (task: TaskDetail) => {
-        setActiveTaskId(task.id);
-        setActiveTask({ ...task, steps: task.steps || [] });
+        upsertTask({ ...task, steps: task.steps || [] });
       },
       onStep: (step: TaskStep) => {
-        setActiveTask((current) =>
-          current
-            ? {
-                ...current,
-                steps: [...current.steps, step]
-              }
-            : current
-        );
+        setActiveThread((current) => {
+          if (!current || !streamedTaskId) return current;
+          return {
+            ...current,
+            tasks: current.tasks.map((task) =>
+              task.id === streamedTaskId
+                ? { ...task, steps: [...task.steps, step] }
+                : task
+            )
+          };
+        });
       },
       onDone: (task: TaskDetail) => {
-        setActiveTaskId(task.id);
-        setActiveTask(task);
-      }
+        upsertTask(task);
+      },
+      threadId: () => streamedThreadId
     };
   }, []);
 
@@ -178,21 +265,34 @@ export function useTasks({ api, token }: UseTasksOptions) {
     if (selected.size !== selectedTools.size) setSelectedTools(selected);
 
     setTaskRunning(true);
+    setTaskError("");
     try {
       const allowed = Array.from(selected);
       const allowedTools = tools.length === 0 || allowed.length === tools.length ? null : allowed;
       const handlers = applyStreamHandlers();
+      const payload = {
+        goal: taskGoal,
+        max_steps: maxSteps,
+        allowed_tools: allowedTools
+      };
 
       if (taskFiles.length) {
-        const pendingTask = await api<TaskDetail>("/tasks", {
-          method: "POST",
-          json: {
-            goal: taskGoal,
-            max_steps: maxSteps,
-            allowed_tools: allowedTools,
-            run: false
-          }
-        });
+        let pendingTask: TaskDetail;
+        if (activeThreadId) {
+          pendingTask = await api<TaskDetail>(`/threads/${activeThreadId}/tasks`, {
+            method: "POST",
+            json: { ...payload, run: false }
+          });
+        } else {
+          const pendingThread = await api<AgentThreadDetail>("/threads", {
+            method: "POST",
+            json: { ...payload, run: false }
+          });
+          pendingTask = pendingThread.tasks[pendingThread.tasks.length - 1];
+          if (!pendingTask) throw new Error("Thread was created without a task.");
+          setActiveThreadId(pendingThread.id);
+          setActiveThread(pendingThread);
+        }
 
         for (const file of taskFiles) {
           const form = new FormData();
@@ -210,29 +310,34 @@ export function useTasks({ api, token }: UseTasksOptions) {
           ...handlers
         });
       } else {
-        await streamTaskRun("/tasks?stream=true", {
+        const path = activeThreadId
+          ? `/threads/${activeThreadId}/tasks?stream=true`
+          : "/threads?stream=true";
+        await streamTaskRun(path, {
           token,
           method: "POST",
-          json: {
-            goal: taskGoal,
-            max_steps: maxSteps,
-            allowed_tools: allowedTools
-          },
+          json: payload,
           ...handlers
         });
       }
 
       setTaskGoal("");
       setTaskFiles([]);
-      await loadTasks();
+      await loadThreads();
+      const completedThreadId = handlers.threadId() || activeThreadId;
+      if (completedThreadId) await selectThread(completedThreadId);
+    } catch (error) {
+      setTaskError(error instanceof Error ? error.message : "Agent task failed");
     } finally {
       setTaskRunning(false);
     }
   }, [
     api,
+    activeThreadId,
     applyStreamHandlers,
-    loadTasks,
+    loadThreads,
     maxSteps,
+    selectThread,
     selectedTools,
     taskFiles,
     taskGoal,
@@ -243,18 +348,20 @@ export function useTasks({ api, token }: UseTasksOptions) {
   return {
     tools,
     selectedTools,
-    tasks,
-    activeTaskId,
-    activeTask,
+    threads,
+    activeThreadId,
+    activeThread,
     taskGoal,
     taskFiles,
     maxSteps,
     taskRunning,
+    taskError,
     setTaskGoal,
     setMaxSteps,
-    loadTasks,
-    selectTask,
-    startNewTask,
+    loadThreads,
+    selectThread,
+    deleteThread,
+    startNewThread,
     runTask,
     selectAllTools,
     clearTools,

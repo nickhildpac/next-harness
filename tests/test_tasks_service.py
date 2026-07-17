@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.db.models import Document, Note, Translation, TranslationTurn
 from app.ports.llm import ChatMessage, GenerationParams, LLMResult
-from app.schemas.task import TaskCreate
+from app.schemas.task import TaskCreate, ThreadCreate
 from app.services.tasks import TaskDocumentUpload, TaskService
 from tests.conftest import FakeEmbeddings, FakeVectorStore
 
@@ -96,24 +96,13 @@ async def test_stream_run_yields_task_step_done_and_persists(session):
     async for frame in service.stream_create_and_run(
         TaskCreate(goal="Report the time", user_id="alice", max_steps=4)
     ):
-        if frame.startswith("data: [DONE]"):
-            events.append(("done_marker", {}))
-            continue
-        event_name = "message"
-        data = ""
-        for line in frame.strip().split("\n"):
-            if line.startswith("event:"):
-                event_name = line[6:].strip()
-            if line.startswith("data:"):
-                data = line[5:].strip()
-        if data and data != "[DONE]":
-            events.append((event_name, json.loads(data)))
+        parsed = json.loads(frame)
+        events.append((parsed["event"], parsed["data"]))
 
     names = [name for name, _ in events]
     assert names[0] == "task"
     assert "step" in names
-    assert names[-2] == "done"
-    assert names[-1] == "done_marker"
+    assert names[-1] == "done"
 
     steps = [payload for name, payload in events if name == "step"]
     assert any(s.get("tool_name") == "now" for s in steps)
@@ -337,6 +326,54 @@ async def test_list_tasks_scoped_by_user(session):
     assert [t.goal for t in bob] == ["B"]
 
 
+async def test_thread_follow_up_receives_prior_goal_and_summary(session):
+    llm = ScriptedLLM(
+        [
+            '<tool_call>{"name":"finish","arguments":{"summary":"First result"}}</tool_call>',
+            '<tool_call>{"name":"finish","arguments":{"summary":"Follow-up result"}}</tool_call>',
+        ]
+    )
+    service = _service(session, llm)
+
+    thread = await service.create_thread(
+        ThreadCreate(goal="Research the topic", user_id="alice")
+    )
+    follow_up = await service.create_thread_task(
+        thread.id,
+        TaskCreate(goal="Turn that into an outline", user_id="alice"),
+        "alice",
+    )
+
+    assert follow_up.thread_id == thread.id
+    detail = await service.get_thread(thread.id, "alice")
+    assert [task.goal for task in detail.tasks] == [
+        "Research the topic",
+        "Turn that into an outline",
+    ]
+    second_prompt = "\n".join(message.content for message in llm.calls[1])
+    assert "Thread history:" in second_prompt
+    assert "Goal: Research the topic" in second_prompt
+    assert "Summary: First result" in second_prompt
+    assert "Goal: Turn that into an outline" in second_prompt
+
+
+async def test_delete_thread_removes_thread_and_tasks(session):
+    llm = ScriptedLLM(
+        ['<tool_call>{"name":"finish","arguments":{"summary":"done"}}</tool_call>']
+    )
+    service = _service(session, llm)
+    thread = await service.create_thread(
+        ThreadCreate(goal="Delete me", user_id="alice")
+    )
+
+    await service.delete_thread(thread.id, "alice")
+
+    with pytest.raises(Exception) as exc_info:
+        await service.get_thread(thread.id, "alice")
+    assert getattr(exc_info.value, "status_code", None) == 404
+    assert await service.list_threads("alice") == []
+
+
 def test_task_schema_accepts_prompt_alias():
     payload = TaskCreate.model_validate({"prompt": "do the thing"})
     assert payload.goal == "do the thing"
@@ -350,4 +387,8 @@ def test_openapi_exposes_task_routes():
     assert "/tasks/{task_id}/documents" in paths
     assert "/tasks/{task_id}/run" in paths
     assert "/tasks/{task_id}" in paths
+    assert "/threads" in paths
+    assert "/threads/{thread_id}" in paths
+    assert "/threads/{thread_id}/tasks" in paths
+    assert paths["/threads/{thread_id}"]["delete"]
     assert "/tools" in paths

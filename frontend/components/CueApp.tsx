@@ -118,7 +118,7 @@ export function CueApp() {
     if (!user) return;
     if (tab === "notes" && !notes.notes.length) void notes.loadNotes();
     if (tab === "translate" && !translate.translationSessions.length) void translate.loadTranslationSessions();
-    if (tab === "tasks" && !tasks.tasks.length) void tasks.loadTasks();
+    if (tab === "tasks" && !tasks.threads.length) void tasks.loadThreads();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, user]);
 
@@ -166,7 +166,7 @@ export function CueApp() {
       : tab === "translate"
         ? "New translation"
         : tab === "tasks"
-          ? "New task"
+          ? "New thread"
           : "New conversation";
 
   return (
@@ -218,7 +218,9 @@ export function CueApp() {
                   ? "Chats"
                   : item === "translate"
                     ? "Translate"
-                    : item[0].toUpperCase() + item.slice(1)}
+                    : item === "tasks"
+                      ? "Agent"
+                      : item[0].toUpperCase() + item.slice(1)}
               </button>
             ))}
           </div>
@@ -227,7 +229,7 @@ export function CueApp() {
             onClick={() => {
               if (tab === "notes") void notes.createNote();
               else if (tab === "translate") translate.startNewTranslationSession();
-              else if (tab === "tasks") tasks.startNewTask();
+              else if (tab === "tasks") tasks.startNewThread();
               else chat.setNewModalOpen(true);
             }}
           >
@@ -287,16 +289,30 @@ export function CueApp() {
     if (tab === "tasks") {
       return (
         <div className={styles.sidebarList}>
-          {tasks.tasks.map((task) => (
-            <button
-              key={task.id}
-              className={`${styles.listItem} ${tasks.activeTaskId === task.id ? styles.listItemActive : ""}`}
-              onClick={() => void tasks.selectTask(task.id)}
-            >
-              <span className={styles.listTitle}>{task.goal}</span>
-              <span className={styles.preview}>{task.status}</span>
-            </button>
-          ))}
+          {tasks.threads.map((thread) => {
+            const latestTask = thread.tasks.at(-1);
+            return (
+            <div key={thread.id} className={styles.listItemRow}>
+              <button
+                className={`${styles.listItem} ${tasks.activeThreadId === thread.id ? styles.listItemActive : ""}`}
+                onClick={() => void tasks.selectThread(thread.id)}
+              >
+                <span className={styles.listTitle}>{thread.title || "Untitled thread"}</span>
+                <span className={styles.preview}>
+                  {latestTask?.result_summary || latestTask?.status || "No tasks yet"}
+                </span>
+              </button>
+              <button
+                className={styles.listItemDelete}
+                title="Delete thread"
+                aria-label="Delete thread"
+                onClick={() => void tasks.deleteThread(thread.id)}
+              >
+                🗑
+              </button>
+            </div>
+            );
+          })}
         </div>
       );
     }
@@ -380,15 +396,18 @@ export function CueApp() {
         <>
           <div className={styles.header}>
             <div className={styles.headerTitle}>
-              <div className={styles.title}>Cue Task Console</div>
+              <div className={styles.title}>Cue Agent Console</div>
               <div className={styles.subtitle}>agentic tool-use surface</div>
             </div>
           </div>
           <div className={styles.taskPanel}>
             <div className={styles.taskTraceScroll}>
-              <TaskTrace activeTask={tasks.activeTask} />
+              <TaskTrace activeThread={tasks.activeThread} />
             </div>
             <div className={styles.taskComposerBar}>
+              {tasks.taskError ? (
+                <div className={styles.statusBar}>{tasks.taskError}</div>
+              ) : null}
               <TaskComposer
                 tools={tasks.tools}
                 selectedTools={tasks.selectedTools}

@@ -189,6 +189,41 @@
   background: var(--surface-selected);
 }
 
+.listItemRow {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.listItemRow .listItem {
+  flex: 1;
+  min-width: 0;
+}
+
+.listItemDelete {
+  opacity: 0;
+  width: 34px;
+  min-width: 34px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: oklch(0.6 0.02 55);
+  font-size: 14px;
+  cursor: pointer;
+  align-self: center;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.listItemRow:hover .listItemDelete,
+.listItemDelete:focus-visible {
+  opacity: 1;
+}
+
+.listItemDelete:hover {
+  background: var(--surface-hover);
+  color: oklch(0.55 0.14 30);
+}
+
 .listTitleRow {
   display: flex;
   align-items: center;
@@ -859,6 +894,39 @@
 .taskStepFinal {
   border-left-color: var(--ok);
   background: var(--tint-ok);
+}
+
+.taskActivity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 12px;
+  background: var(--surface-card);
+}
+
+.taskActivityRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.taskActivityLabel {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.taskActivityFailed .taskActivityLabel {
+  background: var(--tint-err);
+  color: var(--err);
 }
 
 .pre {

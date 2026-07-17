@@ -58,12 +58,13 @@ SQLite is the default for local development. Compose overrides `DATABASE_URL` to
 
 Task/agent surface (primary):
 
-- `POST /tasks` — create + run an agent task. Body: `{"goal": "...", "user_id": "...", "max_steps": 8, "allowed_tools": ["list_notes", "create_note"]}`. Also accepts `prompt`/`objective`/`task` as goal aliases. Set `run: false` to persist without running.
+- `POST /tasks` — create + run an agent task. Body: `{"goal": "...", "user_id": "...", "max_steps": 8, "allowed_tools": ["list_notes", "create_note"]}`. Also accepts `prompt`/`objective`/`task` as goal aliases. Set `run: false` to persist without running. With `?stream=true`, returns `application/x-ndjson` lines `{"event":"task|step|done|error","data":...}`.
 - `POST /tasks/{task_id}/documents` — attach a `.pdf`, `.txt`, or `.md` document to a pending task with multipart form data. Uploaded documents become task-scoped RAG context for `list_task_documents` and `search_task_documents`.
-- `POST /tasks/{task_id}/run` — run a pending task after optional document uploads.
+- `POST /tasks/{task_id}/run` — run a pending task after optional document uploads (`?stream=true` uses the same NDJSON framing).
 - `GET /tasks?user_id=...` — list past runs.
 - `GET /tasks/{task_id}` — inspect a run (status, `result_summary`, per-step trace).
 - `GET /tools` — introspect registered tools and their JSON parameter schemas.
+- `POST/GET /mcp/` — MCP Streamable HTTP endpoint for task-agent tools (Bearer JWT or `MCP_HTTP_AUTH_TOKEN`). Cursor IDE still uses stdio: `python -m app.mcp`. Chat has no MCP tools.
 
 Chat/notes/translations surface (secondary):
 

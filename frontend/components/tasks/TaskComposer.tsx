@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from "react";
 import type { ToolInfo } from "@/lib/types";
 import {
   formatFileSize,
@@ -111,6 +111,12 @@ export function TaskComposer({
           placeholder="e.g. Summarize my last 3 notes and save the summary as a new note."
           value={taskGoal}
           onChange={(event) => onGoalChange(event.target.value)}
+          onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              if (!taskRunDisabled) onRunTask();
+            }
+          }}
         />
         <div className={styles.composerActionsOverlay}>
           <div className={styles.toolsDropdown} ref={dropdownRef}>
@@ -175,8 +181,13 @@ export function TaskComposer({
               }}
             />
           </label>
-          <button className={styles.primaryButton} disabled={taskRunDisabled} onClick={onRunTask}>
-            {taskRunning ? "Running..." : "Run task"}
+          <button
+            className={styles.sendButton}
+            disabled={taskRunDisabled}
+            title={taskRunning ? "Running..." : "Run agent task"}
+            onClick={onRunTask}
+          >
+            ↑
           </button>
         </div>
       </div>
@@ -188,9 +199,11 @@ export function TaskComposer({
         </div>
       ) : (
         <div className={styles.hint}>
-          {effectiveSelectedTools.size === tools.length
-            ? "All registered tools are available. The backend keeps finish in scope automatically."
-            : `${effectiveSelectedTools.size} of ${tools.length} tools selected. The backend keeps finish in scope automatically.`}
+          {taskRunning
+            ? "Running agent task..."
+            : effectiveSelectedTools.size === tools.length
+              ? "Enter to run · Shift+Enter for new line · all registered tools are available"
+              : `Enter to run · Shift+Enter for new line · ${effectiveSelectedTools.size} of ${tools.length} tools selected`}
         </div>
       )}
     </>

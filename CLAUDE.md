@@ -53,7 +53,8 @@ routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
 - **`app/orchestration/agent_graph.py`** — LangGraph loop with two nodes: `reason` (LLM turn) →
   `act` (dispatch tool calls via `ToolInvoker`) → `reason` again. Exits when the model emits
   `finish`, produces a reply with no tool calls, or hits `max_steps`. Production runs use an MCP
-  stdio client (`HybridToolInvoker`: local `finish`, other tools via `python -m app.mcp`).
+  Streamable HTTP client (`HybridToolInvoker`: local `finish`, other tools via the mounted
+  `/mcp` endpoint). Cursor still uses stdio (`python -m app.mcp` via `.cursor/mcp.json`).
 - **`app/orchestration/chat_graph.py`** — the older single-node LLM wrapper, retained for the chat
   surface.
 - **`app/services/tasks.py`** — `TaskService` creates an `AgentTask`, runs the loop against a
@@ -96,7 +97,7 @@ the OpenRouter model is set inside its adapter. Ollama is expected at `localhost
   blocks in its content. `parse_tool_calls` extracts them and treats the remaining text as visible
   reasoning (persisted as a `thought` step).
 - One loop iteration = one `reason` LLM turn plus zero-or-more tool calls executed by `act` (via
-  MCP stdio for non-`finish` tools; `finish` is local). If the model returns *no* tool calls after
+  MCP Streamable HTTP for non-`finish` tools; `finish` is local). If the model returns *no* tool calls after
   retries, the run errors (`model refused to call tools`). If it calls the built-in `finish` tool,
   the run completes with `finish.summary` as `result_summary`.
 - `max_steps` (default 8, capped at 32) counts reason turns; hitting it marks the task `failed`
@@ -148,9 +149,12 @@ Task/agent surface (primary):
 - `POST /tasks/{task_id}/run` — run a pending task after optional document uploads.
 - `GET /tasks?user_id=...`, `GET /tasks/{task_id}` — list and inspect runs.
 - `GET /tools` — introspect the registered tool set (name, description, JSON schema).
-- MCP stdio server: `python -m app.mcp` (Cursor: `.cursor/mcp.json`); tools mirror
-  `build_default_registry()` via `Tool.spec()`, excluding `finish`. Identity via
-  `MCP_USER_ID` / `MCP_TASK_ID` or per-call `user_id` / `task_id` args.
+- Task streaming: `POST /tasks?stream=true` and `POST /tasks/{id}/run?stream=true` return
+  `application/x-ndjson` lines `{"event":"task|step|done|error","data":...}` (not SSE).
+- MCP Streamable HTTP: `POST/GET /mcp` (Bearer JWT or `MCP_HTTP_AUTH_TOKEN`); task agents call
+  this in-process. Cursor still uses MCP stdio: `python -m app.mcp` (`.cursor/mcp.json`); tools
+  mirror `build_default_registry()` via `Tool.spec()`, excluding `finish`. Identity via
+  `MCP_USER_ID` / `MCP_TASK_ID` or per-call `user_id` / `task_id` args. Chat has no MCP tools.
 
 Chat/notes/translations surface (secondary): `POST /conversations`, `GET /conversations/{id}`,
 `PATCH /conversations/{id}/tone`, `POST /conversations/{id}/messages?stream=true` (SSE),

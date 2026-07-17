@@ -186,11 +186,32 @@ class TaskStepKind(str, Enum):
     error = "error"
 
 
-class AgentTask(Base, IdMixin, TimestampMixin):
-    __tablename__ = "agent_tasks"
-    __table_args__ = (Index("ix_agent_tasks_user_updated", "user_id", "updated_at"),)
+class AgentThread(Base, IdMixin, TimestampMixin):
+    __tablename__ = "agent_threads"
+    __table_args__ = (Index("ix_agent_threads_user_updated", "user_id", "updated_at"),)
 
     user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    tasks: Mapped[list["AgentTask"]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        order_by="AgentTask.sequence_index",
+    )
+
+
+class AgentTask(Base, IdMixin, TimestampMixin):
+    __tablename__ = "agent_tasks"
+    __table_args__ = (
+        Index("ix_agent_tasks_user_updated", "user_id", "updated_at"),
+        Index("ix_agent_tasks_thread_sequence", "thread_id", "sequence_index"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_threads.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    sequence_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     goal: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
         String(32), default=TaskStatus.pending.value, nullable=False, index=True
@@ -202,6 +223,7 @@ class AgentTask(Base, IdMixin, TimestampMixin):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     allowed_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    thread: Mapped[AgentThread | None] = relationship(back_populates="tasks")
     steps: Mapped[list["AgentTaskStep"]] = relationship(
         back_populates="task",
         cascade="all, delete-orphan",

@@ -9,10 +9,11 @@ import httpx
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.mcp_client import McpStdioSession
-from app.api.sse import sse_done, sse_event
+from app.adapters.mcp_client import McpStdioSession, McpStreamableHttpSession
+from app.api.ndjson import ndjson_event
 from app.core.config import Settings
-from app.db.models import AgentTask, TaskStatus, TaskStepKind
+from app.db.base import utcnow
+from app.db.models import AgentTask, AgentThread, TaskStatus, TaskStepKind
 from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import GenerationParams, LLMClient
@@ -20,7 +21,16 @@ from app.ports.tools import ToolInvoker
 from app.ports.vectorstore import VectorStore
 from app.repositories.documents import DocumentRepository
 from app.repositories.tasks import TaskRepository
-from app.schemas.task import TaskCreate, TaskDetail, TaskResponse, TaskStepResponse, ToolInfo
+from app.schemas.task import (
+    TaskCreate,
+    TaskDetail,
+    TaskResponse,
+    TaskStepResponse,
+    ThreadCreate,
+    ThreadDetail,
+    ThreadResponse,
+    ToolInfo,
+)
 from app.services.rag import RagService
 from app.tools.mcp_invoker import HybridToolInvoker
 from app.tools.registry import Tool, ToolContext, ToolRegistry, build_default_registry
@@ -46,6 +56,8 @@ class TaskService:
         vectorstore: VectorStore | None = None,
         *,
         use_mcp_tools: bool = True,
+        mcp_auth_token: str | None = None,
+        mcp_http_client: httpx.AsyncClient | None = None,
     ):
         self.session = session
         self.settings = settings
@@ -54,6 +66,8 @@ class TaskService:
         self.embeddings = embeddings
         self.vectorstore = vectorstore
         self.use_mcp_tools = use_mcp_tools
+        self.mcp_auth_token = mcp_auth_token
+        self.mcp_http_client = mcp_http_client
         self.repo = TaskRepository(session)
         self._registry = build_default_registry()
 
@@ -64,26 +78,86 @@ class TaskService:
         ]
 
     async def create_task(self, payload: TaskCreate) -> TaskDetail:
-        task = await self.repo.create(
-            user_id=payload.user_id,
-            goal=payload.goal,
-            max_steps=payload.max_steps,
-            allowed_tools=payload.allowed_tools,
-        )
+        task = await self._create_task_record(payload)
         if not payload.run:
             await self.session.commit()
             return await self._detail(task.id)
         return await self._run_task(task)
 
     async def stream_create_and_run(self, payload: TaskCreate) -> AsyncIterator[str]:
-        """Create a task and stream the agent run as SSE frames."""
-        task = await self.repo.create(
+        """Create a task and stream the agent run as NDJSON events."""
+        try:
+            task = await self._create_task_record(payload)
+            await self.session.commit()
+        except HTTPException as exc:
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": exc.detail})
+            return
+        except Exception as exc:  # noqa: BLE001
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
+            return
+        async for frame in self.stream_run(task):
+            yield frame
+
+    async def create_thread(self, payload: ThreadCreate) -> ThreadDetail:
+        thread = await self.repo.create_thread(
             user_id=payload.user_id,
-            goal=payload.goal,
-            max_steps=payload.max_steps,
-            allowed_tools=payload.allowed_tools,
+            title=payload.title or payload.goal[:255],
         )
-        await self.session.commit()
+        task_payload = TaskCreate(**payload.model_dump(exclude={"title"}))
+        task = await self._create_task_record(task_payload, thread=thread)
+        if payload.run:
+            await self._run_task(task)
+        else:
+            await self.session.commit()
+        return await self._thread_detail(thread.id, payload.user_id)
+
+    async def stream_create_thread_and_run(self, payload: ThreadCreate) -> AsyncIterator[str]:
+        try:
+            thread = await self.repo.create_thread(
+                user_id=payload.user_id,
+                title=payload.title or payload.goal[:255],
+            )
+            task_payload = TaskCreate(**payload.model_dump(exclude={"title"}))
+            task = await self._create_task_record(task_payload, thread=thread)
+            await self.session.commit()
+        except HTTPException as exc:
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": exc.detail})
+            return
+        except Exception as exc:  # noqa: BLE001
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
+            return
+        async for frame in self.stream_run(task):
+            yield frame
+
+    async def create_thread_task(
+        self, thread_id: str, payload: TaskCreate, user_id: str
+    ) -> TaskDetail:
+        thread = await self._thread_for_user(thread_id, user_id)
+        task = await self._create_task_record(payload, thread=thread)
+        if not payload.run:
+            await self.session.commit()
+            return await self._detail(task.id)
+        return await self._run_task(task)
+
+    async def stream_create_thread_task_and_run(
+        self, thread_id: str, payload: TaskCreate, user_id: str
+    ) -> AsyncIterator[str]:
+        try:
+            thread = await self._thread_for_user(thread_id, user_id)
+            task = await self._create_task_record(payload, thread=thread)
+            await self.session.commit()
+        except HTTPException as exc:
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": exc.detail})
+            return
+        except Exception as exc:  # noqa: BLE001
+            await self.session.rollback()
+            yield ndjson_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
+            return
         async for frame in self.stream_run(task):
             yield frame
 
@@ -105,8 +179,7 @@ class TaskService:
                     detail=f"Task cannot be run from status '{task.status}'.",
                 )
         except HTTPException as exc:
-            yield sse_event("error", {"error": exc.detail})
-            yield sse_done()
+            yield ndjson_event("error", {"error": exc.detail})
             return
         async for frame in self.stream_run(task):
             yield frame
@@ -128,13 +201,13 @@ class TaskService:
         return documents[-1]
 
     async def stream_run(self, task: AgentTask) -> AsyncIterator[str]:
-        """Run the agent loop, persisting and yielding each step as SSE."""
+        """Run the agent loop, persisting and yielding each step as NDJSON."""
         try:
             self._validate_allowed_tools(task.allowed_tools)
             uploaded_document_count = await self._task_document_count(task.id)
             await self.repo.set_status(task, TaskStatus.running)
             await self.session.commit()
-            yield sse_event(
+            yield ndjson_event(
                 "task",
                 {
                     **TaskResponse.model_validate(task).model_dump(mode="json"),
@@ -143,12 +216,18 @@ class TaskService:
             )
 
             context = self._tool_context(task, uploaded_document_count=uploaded_document_count)
+            prior_context = await self._build_thread_context(task)
             final_run: AgentRun | None = None
             step_index = 0
 
             async with self._tool_invoker(task) as invoker:
                 graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
-                async for mode, chunk in graph.stream(task.goal, self._params(), context):
+                async for mode, chunk in graph.stream(
+                    task.goal,
+                    self._params(),
+                    context,
+                    prior_context=prior_context,
+                ):
                     if mode == "custom" and isinstance(chunk, StepRecord):
                         row = await self.repo.add_step(
                             task,
@@ -161,7 +240,7 @@ class TaskService:
                         )
                         step_index += 1
                         await self.session.commit()
-                        yield sse_event(
+                        yield ndjson_event(
                             "step",
                             TaskStepResponse.model_validate(row).model_dump(mode="json"),
                         )
@@ -178,8 +257,7 @@ class TaskService:
             await self._finalize_run_status(task, final_run)
             await self.session.commit()
             detail = await self._detail(task.id)
-            yield sse_event("done", detail.model_dump(mode="json"))
-            yield sse_done()
+            yield ndjson_event("done", detail.model_dump(mode="json"))
             logger.info(
                 "task_run_completed",
                 extra={
@@ -191,8 +269,7 @@ class TaskService:
             )
         except HTTPException as exc:
             await self.session.rollback()
-            yield sse_event("error", {"error": exc.detail})
-            yield sse_done()
+            yield ndjson_event("error", {"error": exc.detail})
         except Exception as exc:  # noqa: BLE001
             await self.session.rollback()
             logger.exception("task_stream_failed", extra={"task_id": getattr(task, "id", None)})
@@ -203,8 +280,7 @@ class TaskService:
                 await self.session.commit()
             except Exception:  # noqa: BLE001
                 await self.session.rollback()
-            yield sse_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
-            yield sse_done()
+            yield ndjson_event("error", {"error": f"{exc.__class__.__name__}: {exc}"})
 
     async def _run_task(self, task: AgentTask) -> TaskDetail:
         self._validate_allowed_tools(task.allowed_tools)
@@ -213,9 +289,15 @@ class TaskService:
         await self.session.commit()
 
         context = self._tool_context(task, uploaded_document_count=uploaded_document_count)
+        prior_context = await self._build_thread_context(task)
         async with self._tool_invoker(task) as invoker:
             graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
-            run = await graph.run(task.goal, self._params(), context)
+            run = await graph.run(
+                task.goal,
+                self._params(),
+                context,
+                prior_context=prior_context,
+            )
 
         await self._persist_run(task, run)
         await self.session.commit()
@@ -230,15 +312,50 @@ class TaskService:
         )
         return await self._detail(task.id)
 
+    async def _create_task_record(
+        self,
+        payload: TaskCreate,
+        *,
+        thread: AgentThread | None = None,
+    ) -> AgentTask:
+        if thread is None and payload.thread_id:
+            thread = await self._thread_for_user(payload.thread_id, payload.user_id)
+        if thread is not None and thread.user_id != payload.user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
+
+        sequence_index = (
+            await self.repo.next_sequence_index(thread.id) if thread is not None else 0
+        )
+        task = await self.repo.create(
+            user_id=payload.user_id,
+            thread_id=thread.id if thread is not None else None,
+            sequence_index=sequence_index,
+            goal=payload.goal,
+            max_steps=payload.max_steps,
+            allowed_tools=payload.allowed_tools,
+        )
+        if thread is not None:
+            thread.updated_at = utcnow()
+            await self.session.flush()
+        return task
+
     @asynccontextmanager
     async def _tool_invoker(self, task: AgentTask) -> AsyncIterator[ToolInvoker]:
         if self.use_mcp_tools:
-            async with McpStdioSession.from_settings(
-                self.settings,
-                user_id=task.user_id,
-                task_id=task.id,
-            ) as mcp:
-                yield await HybridToolInvoker.create(mcp, allowed_tools=task.allowed_tools)
+            if self.settings.mcp_transport == "stdio":
+                async with McpStdioSession.from_settings(
+                    self.settings,
+                    user_id=task.user_id,
+                    task_id=task.id,
+                ) as mcp:
+                    yield await HybridToolInvoker.create(mcp, allowed_tools=task.allowed_tools)
+            else:
+                async with McpStreamableHttpSession.from_settings(
+                    self.settings,
+                    auth_token=self.mcp_auth_token,
+                    http_client=self.mcp_http_client,
+                ) as mcp:
+                    yield await HybridToolInvoker.create(mcp, allowed_tools=task.allowed_tools)
         else:
             yield self._scoped_registry(task.allowed_tools)
 
@@ -266,6 +383,18 @@ class TaskService:
     async def list_tasks(self, user_id: str) -> list[TaskResponse]:
         tasks = await self.repo.list_for_user(user_id)
         return [TaskResponse.model_validate(t) for t in tasks]
+
+    async def list_threads(self, user_id: str) -> list[ThreadResponse]:
+        threads = await self.repo.list_threads_for_user(user_id)
+        return [ThreadResponse.model_validate(thread) for thread in threads]
+
+    async def get_thread(self, thread_id: str, user_id: str) -> ThreadDetail:
+        return await self._thread_detail(thread_id, user_id)
+
+    async def delete_thread(self, thread_id: str, user_id: str) -> None:
+        thread = await self._thread_for_user(thread_id, user_id)
+        await self.repo.delete_thread(thread)
+        await self.session.commit()
 
     async def get_task(self, task_id: str, user_id: str | None = None) -> TaskDetail:
         return await self._detail(task_id, user_id)
@@ -369,6 +498,27 @@ class TaskService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
         return task
 
+    async def _thread_for_user(self, thread_id: str, user_id: str) -> AgentThread:
+        thread = await self.repo.get_thread(thread_id)
+        if thread is None or thread.user_id != user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
+        return thread
+
+    async def _build_thread_context(self, task: AgentTask) -> str | None:
+        if task.thread_id is None:
+            return None
+        prior_tasks = await self.repo.list_completed_tasks_in_thread(
+            task.thread_id,
+            before_sequence=task.sequence_index,
+        )
+        if not prior_tasks:
+            return None
+        return "\n".join(
+            f"[{prior.sequence_index + 1}] Goal: {prior.goal}\n"
+            f"Summary: {prior.result_summary or 'Completed without a summary.'}"
+            for prior in prior_tasks
+        )
+
     async def _task_document_count(self, task_id: str) -> int:
         return len(await DocumentRepository(self.session).list_by_task(task_id))
 
@@ -383,3 +533,9 @@ class TaskService:
             **TaskResponse.model_validate(task).model_dump(),
             steps=[TaskStepResponse.model_validate(s) for s in task.steps],
         )
+
+    async def _thread_detail(self, thread_id: str, user_id: str) -> ThreadDetail:
+        thread = await self.repo.get_thread_with_tasks(thread_id)
+        if thread is None or thread.user_id != user_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
+        return ThreadDetail.model_validate(thread)

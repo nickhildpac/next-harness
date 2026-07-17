@@ -149,6 +149,8 @@ export type Language = {
 export type Task = {
   id: string;
   user_id: string;
+  thread_id: string | null;
+  sequence_index: number;
   goal: string;
   status: string;
   max_steps: number;
@@ -174,6 +176,19 @@ export type TaskStep = {
 
 export type TaskDetail = Task & {
   steps: TaskStep[];
+};
+
+export type AgentThread = {
+  id: string;
+  user_id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+  tasks: Task[];
+};
+
+export type AgentThreadDetail = Omit<AgentThread, "tasks"> & {
+  tasks: TaskDetail[];
 };
 
 export type ToolInfo = {

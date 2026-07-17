@@ -61,10 +61,16 @@ class Settings(BaseSettings):
     rag_token_budget: int = 1500  # cap on the retrieved-chunk share of the context budget
     rag_max_upload_bytes: int = 10 * 1024 * 1024
 
-    # Identity defaults for the stdio MCP tool server (`python -m app.mcp`).
+    # Identity defaults for the MCP tool server (stdio and Streamable HTTP).
     mcp_user_id: str | None = None
     mcp_task_id: str | None = None
-    # AgentGraph MCP client: spawn command/cwd for the stdio subprocess.
+    # Task agent MCP transport. ``streamable_http`` uses the mounted ``/mcp`` endpoint;
+    # ``stdio`` spawns ``python -m app.mcp`` (also used by Cursor).
+    mcp_transport: Literal["streamable_http", "stdio"] = "streamable_http"
+    mcp_streamable_url: str = "http://127.0.0.1:8000/mcp/"
+    # Optional shared bearer for TaskService → /mcp (in addition to user JWTs).
+    mcp_http_auth_token: str | None = None
+    # AgentGraph MCP stdio client: spawn command/cwd for the subprocess.
     # When unset, defaults to ``[sys.executable, "-m", "app.mcp"]``.
     mcp_server_command: list[str] | None = None
     mcp_server_cwd: str | None = None
@@ -84,7 +90,13 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("mcp_user_id", "mcp_task_id", "mcp_server_cwd", mode="before")
+    @field_validator(
+        "mcp_user_id",
+        "mcp_task_id",
+        "mcp_server_cwd",
+        "mcp_http_auth_token",
+        mode="before",
+    )
     @classmethod
     def empty_mcp_identity_as_none(cls, value):
         if value == "":
@@ -97,6 +109,13 @@ class Settings(BaseSettings):
         if value == "" or value == []:
             return None
         return value
+
+    @field_validator("mcp_streamable_url", mode="before")
+    @classmethod
+    def empty_mcp_streamable_url_as_default(cls, value):
+        if value == "" or value is None:
+            return "http://127.0.0.1:8000/mcp/"
+        return value.rstrip("/") + "/"
 
     tones: dict[str, ToneDefinition] = {
         "professional": ToneDefinition(

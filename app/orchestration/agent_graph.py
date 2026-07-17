@@ -105,12 +105,14 @@ class AgentGraph:
         goal: str,
         params: GenerationParams,
         context: ToolContext,
+        *,
+        prior_context: str | None = None,
     ) -> tuple[AgentRun, _AgentState]:
         run = AgentRun(goal=goal)
-        messages: list[BaseMessage] = [
-            SystemMessage(content=self.system_prompt()),
-            HumanMessage(content=f"Goal: {goal}"),
-        ]
+        messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt())]
+        if prior_context:
+            messages.append(HumanMessage(content=f"Thread history:\n{prior_context}"))
+        messages.append(HumanMessage(content=f"Goal: {goal}"))
         goal_hint = self._goal_tool_hint(goal, metadata=context.metadata)
         if goal_hint:
             messages.append(HumanMessage(content=goal_hint))
@@ -134,8 +136,10 @@ class AgentGraph:
         goal: str,
         params: GenerationParams,
         context: ToolContext,
+        *,
+        prior_context: str | None = None,
     ) -> AgentRun:
-        run, state = self._initial_state(goal, params, context)
+        run, state = self._initial_state(goal, params, context, prior_context=prior_context)
         try:
             final_state = await self.graph.ainvoke(state)
         except Exception as exc:  # noqa: BLE001
@@ -150,9 +154,11 @@ class AgentGraph:
         goal: str,
         params: GenerationParams,
         context: ToolContext,
+        *,
+        prior_context: str | None = None,
     ) -> AsyncIterator[tuple[str, Any]]:
         """Yield ``(mode, chunk)`` from LangGraph ``astream`` (custom + values)."""
-        run, state = self._initial_state(goal, params, context)
+        run, state = self._initial_state(goal, params, context, prior_context=prior_context)
         try:
             async for mode, chunk in self.graph.astream(state, stream_mode=["custom", "values"]):
                 yield mode, chunk
