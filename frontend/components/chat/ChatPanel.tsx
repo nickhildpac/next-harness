@@ -114,23 +114,64 @@ export function ChatPanel({
       </div>
       <div className={styles.composerWrap}>
         <div className={styles.composer}>
-          <textarea
-            className={styles.draft}
-            rows={3}
-            placeholder={
-              isDuo
-                ? `Message as ${activeConversation.sendAs || ""}...`
-                : "Message the assistant..."
-            }
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void sendMessage();
+          <div className={styles.composerInputWrap}>
+            <textarea
+              className={styles.draft}
+              rows={3}
+              placeholder={
+                isDuo
+                  ? `Message as ${activeConversation.sendAs || ""}...`
+                  : "Message the assistant..."
               }
-            }}
-          />
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
+            />
+            <div className={styles.composerActionsOverlay}>
+              {!isDuo && activeConversation.use_documents ? (
+                <label
+                  className={styles.iconButton}
+                  title={uploadingDoc ? "Uploading..." : "Upload .pdf, .txt, or .md"}
+                  style={{ opacity: uploadingDoc ? 0.5 : 1, cursor: uploadingDoc ? "default" : "pointer" }}
+                >
+                  📎
+                  <input
+                    hidden
+                    type="file"
+                    accept=".pdf,.txt,.md"
+                    disabled={uploadingDoc}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void uploadDocument(activeConversation.id, file);
+                    }}
+                  />
+                </label>
+              ) : null}
+              {isDuo ? (
+                <button
+                  className={styles.suggestButton}
+                  disabled={suggesting || streaming}
+                  onClick={() =>
+                    void suggestReply(activeConversation.id, activeConversation.sendAs || "")
+                  }
+                >
+                  ✨
+                </button>
+              ) : null}
+              <button
+                className={styles.sendButton}
+                disabled={sendDisabled}
+                onClick={() => void sendMessage()}
+              >
+                ↑
+              </button>
+            </div>
+          </div>
           {!isDuo && activeConversation.use_documents &&
            (activeConversation.documents.length > 0 || activeConversation.docsLoaded) ? (
             <div className={styles.composerDocs}>
@@ -174,37 +215,16 @@ export function ChatPanel({
                 </select>
               </>
             ) : (
-              <>
-                <label className={styles.label}>
-                  <input
-                    type="checkbox"
-                    checked={activeConversation.use_documents}
-                    onChange={(event) =>
-                      void toggleDocuments(activeConversation.id, event.target.checked)
-                    }
-                  />{" "}
-                  Docs
-                </label>
-                {activeConversation.use_documents ? (
-                  <label
-                    className={styles.iconButton}
-                    title={uploadingDoc ? "Uploading..." : "Upload .pdf, .txt, or .md"}
-                    style={{ opacity: uploadingDoc ? 0.5 : 1, cursor: uploadingDoc ? "default" : "pointer" }}
-                  >
-                    📎
-                    <input
-                      hidden
-                      type="file"
-                      accept=".pdf,.txt,.md"
-                      disabled={uploadingDoc}
-                      onChange={(event) => {
-                        const file = event.target.files?.[0];
-                        if (file) void uploadDocument(activeConversation.id, file);
-                      }}
-                    />
-                  </label>
-                ) : null}
-              </>
+              <label className={styles.label}>
+                <input
+                  type="checkbox"
+                  checked={activeConversation.use_documents}
+                  onChange={(event) =>
+                    void toggleDocuments(activeConversation.id, event.target.checked)
+                  }
+                />{" "}
+                Docs
+              </label>
             )}
             <span className={styles.label}>Tone</span>
             <select
@@ -229,25 +249,6 @@ export function ChatPanel({
                 store(PROVIDER_DEFAULT_KEY, value);
               }}
             />
-            <div className={styles.composerActionsSpacer} />
-            {isDuo ? (
-              <button
-                className={styles.suggestButton}
-                disabled={suggesting || streaming}
-                onClick={() =>
-                  void suggestReply(activeConversation.id, activeConversation.sendAs || "")
-                }
-              >
-                ✨
-              </button>
-            ) : null}
-            <button
-              className={styles.sendButton}
-              disabled={sendDisabled}
-              onClick={() => void sendMessage()}
-            >
-              ↑
-            </button>
           </div>
         </div>
         <div className={styles.hint}>

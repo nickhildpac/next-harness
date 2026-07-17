@@ -1,0 +1,13 @@
+{
+	"servers": {
+		"next-harness": {
+		"type": "stdio",
+		"command": "${workspaceFolder}/.venv/bin/python",
+		"args": ["-m", "app.mcp"],
+		"cwd": "${workspaceFolder}",
+		"env": {
+			"MCP_USER_ID": "8839d7de-f7e8-4126-859b-6d53ccfc6e81"
+		}
+		}
+  }
+}

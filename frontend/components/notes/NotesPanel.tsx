@@ -80,7 +80,7 @@ export function NotesPanel({
             />
             {notePreview ? (
               <div
-                className={`${styles.textarea} ${styles.notePreview}`}
+                className={`${styles.textarea} ${styles.notePreview} ${styles.markdownBody}`}
                 dangerouslySetInnerHTML={{ __html: noteHtml }}
               />
             ) : (

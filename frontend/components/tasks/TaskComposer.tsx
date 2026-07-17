@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
 import type { ToolInfo } from "@/lib/types";
 import {
   formatFileSize,
@@ -43,6 +44,27 @@ export function TaskComposer({
   onAddFiles,
   onRemoveFile
 }: TaskComposerProps) {
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!toolsOpen) return;
+    function handlePointer(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setToolsOpen(false);
+      }
+    }
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setToolsOpen(false);
+    }
+    document.addEventListener("mousedown", handlePointer);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointer);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [toolsOpen]);
+
   const availableToolNames = new Set(tools.map((tool) => tool.name));
   const requiredToolNames = [
     ...new Set([
@@ -62,13 +84,6 @@ export function TaskComposer({
 
   return (
     <>
-      <textarea
-        className={styles.textarea}
-        rows={4}
-        placeholder="e.g. Summarize my last 3 notes and save the summary as a new note."
-        value={taskGoal}
-        onChange={(event) => onGoalChange(event.target.value)}
-      />
       {requiredToolNames.length ? (
         <div className={styles.taskHint}>
           <strong>Detected workflow:</strong> this goal needs {requiredToolNames.join(", ")}.
@@ -77,35 +92,8 @@ export function TaskComposer({
             : " Required tools are selected."}
         </div>
       ) : null}
-      <div className={styles.row}>
-        <input
-          className={styles.input}
-          type="number"
-          min={1}
-          max={32}
-          value={maxSteps}
-          onChange={(event) => onMaxStepsChange(Number(event.target.value) || 8)}
-        />
-        <label className={styles.iconButton} title="Attach .pdf, .txt, or .md files">
-          📎
-          <input
-            type="file"
-            multiple
-            accept=".pdf,.txt,.md"
-            style={{ display: "none" }}
-            onChange={(event) => {
-              const files = Array.from(event.target.files || []);
-              onAddFiles(files);
-              event.target.value = "";
-            }}
-          />
-        </label>
-        <button className={styles.primaryButton} disabled={taskRunDisabled} onClick={onRunTask}>
-          {taskRunning ? "Running..." : "Run task"}
-        </button>
-      </div>
       {taskFiles.length ? (
-        <div className={styles.taskFileList} style={{ marginTop: 8 }}>
+        <div className={styles.taskFileList}>
           {taskFiles.map((file, index) => (
             <span key={`${file.name}-${file.size}-${index}`} className={styles.taskFilePill}>
               {file.name} · {formatFileSize(file.size)}
@@ -116,38 +104,81 @@ export function TaskComposer({
           ))}
         </div>
       ) : null}
-      <div className={styles.taskToolbar}>
-        <button className={styles.ghostButton} onClick={onSelectAllTools}>
-          All tools
-        </button>
-        <button className={styles.ghostButton} onClick={onClearTools}>
-          Clear
-        </button>
-        {availablePresets.map((preset) => (
-          <button
-            key={preset.id}
-            className={styles.ghostButton}
-            title={preset.description}
-            onClick={() => onChooseTools(preset.tools)}
-          >
-            {preset.label}
+      <div className={styles.composerInputWrap}>
+        <textarea
+          className={styles.textarea}
+          rows={3}
+          placeholder="e.g. Summarize my last 3 notes and save the summary as a new note."
+          value={taskGoal}
+          onChange={(event) => onGoalChange(event.target.value)}
+        />
+        <div className={styles.composerActionsOverlay}>
+          <div className={styles.toolsDropdown} ref={dropdownRef}>
+            <button className={styles.ghostButton} onClick={() => setToolsOpen((open) => !open)}>
+              Tools · {effectiveSelectedTools.size}/{tools.length}
+            </button>
+            {toolsOpen ? (
+              <div className={styles.toolsDropdownPanel}>
+                <div className={styles.taskToolbar}>
+                  <button className={styles.ghostButton} onClick={onSelectAllTools}>
+                    All tools
+                  </button>
+                  <button className={styles.ghostButton} onClick={onClearTools}>
+                    Clear
+                  </button>
+                  {availablePresets.map((preset) => (
+                    <button
+                      key={preset.id}
+                      className={styles.ghostButton}
+                      title={preset.description}
+                      onClick={() => onChooseTools(preset.tools)}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+                {tools.map((tool) => (
+                  <label key={tool.name} className={styles.toolCheckRow} title={tool.description}>
+                    <input
+                      type="checkbox"
+                      checked={selectedTools.has(tool.name)}
+                      onChange={() => onToggleTool(tool.name)}
+                    />
+                    {tool.name}
+                  </label>
+                ))}
+                <label className={styles.toolCheckRow}>
+                  Max steps
+                  <input
+                    className={styles.input}
+                    type="number"
+                    min={1}
+                    max={32}
+                    value={maxSteps}
+                    onChange={(event) => onMaxStepsChange(Number(event.target.value) || 8)}
+                  />
+                </label>
+              </div>
+            ) : null}
+          </div>
+          <label className={styles.iconButton} title="Attach .pdf, .txt, or .md files">
+            📎
+            <input
+              type="file"
+              multiple
+              accept=".pdf,.txt,.md"
+              style={{ display: "none" }}
+              onChange={(event) => {
+                const files = Array.from(event.target.files || []);
+                onAddFiles(files);
+                event.target.value = "";
+              }}
+            />
+          </label>
+          <button className={styles.primaryButton} disabled={taskRunDisabled} onClick={onRunTask}>
+            {taskRunning ? "Running..." : "Run task"}
           </button>
-        ))}
-      </div>
-      <div className={styles.row} style={{ flexWrap: "wrap" }}>
-        {tools.map((tool) => (
-          <button
-            key={tool.name}
-            className={styles.chip}
-            onClick={() => onToggleTool(tool.name)}
-            style={{
-              borderColor: selectedTools.has(tool.name) ? "var(--accent)" : "var(--border-input)"
-            }}
-            title={tool.description}
-          >
-            {tool.name}
-          </button>
-        ))}
+        </div>
       </div>
       {tools.length > 0 && selectedTools.size === 0 ? (
         <div className={styles.taskHint}>

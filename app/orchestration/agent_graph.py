@@ -232,9 +232,20 @@ class AgentGraph:
                 state["pending_calls"] = []
                 state["messages"] = messages_to_add
                 return state
-            # FIX #1: Model refused to call tools and retries exhausted. Mark as error, not completion.
-            # Only the explicit finish tool sets completed=True.
             summary = parsed.thought or content.strip()
+            # FIX #7: If the agent already ran a tool successfully, a non-empty answer with no
+            # further tool calls is an implicit finish (the model gathered data and reported it),
+            # not a refusal. Treat it as completion so, e.g., "list my translations" doesn't fail
+            # just because the model skipped an explicit finish call.
+            if self._has_successful_tool_call(run):
+                run.final_summary = summary
+                run.completed = True
+                self._emit_step(run, StepRecord(kind="final", content=summary))
+                state["pending_calls"] = []
+                state["messages"] = messages_to_add
+                return state
+            # FIX #1: Model never called any tool and retries are exhausted. This is a genuine
+            # refusal — mark as error, not completion. Only finish/implicit-finish complete a run.
             run.final_summary = summary
             run.errored = True
             run.error = "model refused to call tools"
@@ -327,6 +338,12 @@ class AgentGraph:
         if run.completed or run.errored or run.step_limit_hit:
             return "end"
         return "reason"
+
+    @staticmethod
+    def _has_successful_tool_call(run: AgentRun) -> bool:
+        # A successful tool_result means the agent gathered real information; a subsequent
+        # tool-free answer is a report of that work, not a refusal to use tools.
+        return any(step.kind == "tool_result" and step.ok for step in run.steps)
 
     def _should_retry_false_tool_refusal(self, content: str, state: _AgentState) -> bool:
         # FIX #2/#3: Use work_turn for limit (retries are free). Use > not >= for final turn.

@@ -147,6 +147,22 @@ async def test_agent_treats_no_tool_call_as_error():
     assert "goal is already met" in (run.final_summary or "")
 
 
+async def test_agent_accepts_answer_after_successful_tool_as_implicit_finish():
+    """After a tool runs, a plain-text answer with no finish call completes the run."""
+    llm = ScriptedLLM(
+        [
+            '<tool_call>{"name":"echo","arguments":{"x":1}}</tool_call>',
+            "There are two saved translations: Russian and Korean.",
+        ]
+    )
+    graph = AgentGraph(llm, await _registry(), max_steps=5)
+    run = await graph.run("list my translations", _params(), ToolContext())
+    assert run.completed is True
+    assert run.errored is False
+    assert run.final_summary == "There are two saved translations: Russian and Korean."
+    assert run.steps[-1].kind == "final"
+
+
 async def test_agent_retries_empty_response_then_fails_explicitly():
     llm = ScriptedLLM(["", ""])
     graph = AgentGraph(llm, await _registry(), max_steps=3)

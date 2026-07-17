@@ -1,7 +1,9 @@
 "use client";
 
+import { useMemo } from "react";
+import { marked } from "marked";
 import type { TaskDetail } from "@/lib/types";
-import { taskStepDetail, taskStepLabel } from "../CueApp.helpers";
+import { escapeHtml, sanitizeMarkdownHtml, taskStepDetail, taskStepLabel } from "../CueApp.helpers";
 import styles from "../CueApp.module.css";
 
 type TaskTraceProps = {
@@ -9,9 +11,24 @@ type TaskTraceProps = {
 };
 
 export function TaskTrace({ activeTask }: TaskTraceProps) {
+  const summaryText = activeTask?.result_summary || activeTask?.error || activeTask?.goal || "";
+
+  const summaryHtml = useMemo(() => {
+    if (!summaryText) return "";
+    try {
+      const result = marked.parse(summaryText);
+      return typeof result === "string" ? sanitizeMarkdownHtml(result) : escapeHtml(summaryText);
+    } catch {
+      return escapeHtml(summaryText);
+    }
+  }, [summaryText]);
+
   if (!activeTask) {
     return <div className={styles.empty}>Enter a goal and press Run task, or select a past task.</div>;
   }
+
+  const lastStep = activeTask.steps.at(-1) ?? null;
+  const latestStep = lastStep?.kind === "final" ? null : lastStep;
 
   return (
     <div className={styles.formStack}>
@@ -23,29 +40,32 @@ export function TaskTrace({ activeTask }: TaskTraceProps) {
           <span>{activeTask.model || "model unknown"}</span>
           <span>tools: {activeTask.allowed_tools?.length ? activeTask.allowed_tools.join(", ") : "all registered"}</span>
         </div>
-        <p>{activeTask.result_summary || activeTask.error || activeTask.goal}</p>
+        <div className={styles.markdownBody} dangerouslySetInnerHTML={{ __html: summaryHtml }} />
       </div>
-      {activeTask.steps.map((step) => (
+      {latestStep ? (
         <div
-          key={step.id}
+          key={latestStep.id}
           className={`${styles.taskStep} ${
-            step.kind === "final" ? styles.taskStepFinal : step.kind === "error" || step.ok === false ? styles.taskStepError : ""
+            latestStep.kind === "final"
+              ? styles.taskStepFinal
+              : latestStep.kind === "error" || latestStep.ok === false
+                ? styles.taskStepError
+                : ""
           }`}
         >
           <div className={styles.taskStepHeader}>
-            <span className={styles.taskStepIndex}>#{step.step_index}</span>
-            <strong>{taskStepLabel(step)}</strong>
-            {taskStepDetail(step) ? <span>{taskStepDetail(step)}</span> : null}
-            {step.ok !== null ? (
-              <span className={step.ok ? styles.taskStepOk : styles.taskStepFailed}>
-                {step.ok ? "ok" : "failed"}
+            <span className={styles.taskStepIndex}>#{latestStep.step_index}</span>
+            <strong>{taskStepLabel(latestStep)}</strong>
+            {taskStepDetail(latestStep) ? <span>{taskStepDetail(latestStep)}</span> : null}
+            {latestStep.ok !== null ? (
+              <span className={latestStep.ok ? styles.taskStepOk : styles.taskStepFailed}>
+                {latestStep.ok ? "ok" : "failed"}
               </span>
             ) : null}
           </div>
-          {step.content ? <p>{step.content}</p> : null}
-          {step.payload ? <pre className={styles.pre}>{JSON.stringify(step.payload, null, 2)}</pre> : null}
+          {latestStep.content ? <p>{latestStep.content}</p> : null}
         </div>
-      ))}
+      ) : null}
     </div>
   );
 }

@@ -384,8 +384,11 @@ export function CueApp() {
               <div className={styles.subtitle}>agentic tool-use surface</div>
             </div>
           </div>
-          <div className={styles.panel}>
-            <div className={styles.formStack}>
+          <div className={styles.taskPanel}>
+            <div className={styles.taskTraceScroll}>
+              <TaskTrace activeTask={tasks.activeTask} />
+            </div>
+            <div className={styles.taskComposerBar}>
               <TaskComposer
                 tools={tasks.tools}
                 selectedTools={tasks.selectedTools}
@@ -403,7 +406,6 @@ export function CueApp() {
                 onAddFiles={tasks.addTaskFiles}
                 onRemoveFile={tasks.removeTaskFile}
               />
-              <TaskTrace activeTask={tasks.activeTask} />
             </div>
           </div>
         </>
