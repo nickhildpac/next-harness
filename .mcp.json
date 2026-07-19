@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "next-harness": {
+      "type": "stdio",
+      "command": "/home/dpacx/Work/tries/next-harness/.venv/bin/python",
+      "args": [
+        "-m",
+        "app.mcp"
+      ],
+      "env": {
+        "MCP_USER_ID": "613b0e38-225b-42e0-8da5-00b428059c95"
+      }
+    }
+  }
+}

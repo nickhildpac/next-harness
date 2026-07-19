@@ -14,6 +14,7 @@ from app.api.ndjson import ndjson_event
 from app.core.config import Settings
 from app.db.base import utcnow
 from app.db.models import AgentTask, AgentThread, TaskStatus, TaskStepKind
+from app.guardrails import Guardrails
 from app.orchestration.agent_graph import AgentGraph, AgentRun, StepRecord
 from app.ports.embeddings import EmbeddingsClient
 from app.ports.llm import GenerationParams, LLMClient
@@ -70,6 +71,7 @@ class TaskService:
         self.mcp_http_client = mcp_http_client
         self.repo = TaskRepository(session)
         self._registry = build_default_registry()
+        self.guardrails = Guardrails(enabled=settings.guardrails_enabled)
 
     def available_tools(self) -> list[ToolInfo]:
         return [
@@ -221,7 +223,9 @@ class TaskService:
             step_index = 0
 
             async with self._tool_invoker(task) as invoker:
-                graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
+                graph = AgentGraph(
+                    self.llm, invoker, max_steps=task.max_steps, guardrails=self.guardrails
+                )
                 async for mode, chunk in graph.stream(
                     task.goal,
                     self._params(),
@@ -291,7 +295,9 @@ class TaskService:
         context = self._tool_context(task, uploaded_document_count=uploaded_document_count)
         prior_context = await self._build_thread_context(task)
         async with self._tool_invoker(task) as invoker:
-            graph = AgentGraph(self.llm, invoker, max_steps=task.max_steps)
+            graph = AgentGraph(
+                self.llm, invoker, max_steps=task.max_steps, guardrails=self.guardrails
+            )
             run = await graph.run(
                 task.goal,
                 self._params(),
@@ -323,9 +329,7 @@ class TaskService:
         if thread is not None and thread.user_id != payload.user_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
 
-        sequence_index = (
-            await self.repo.next_sequence_index(thread.id) if thread is not None else 0
-        )
+        sequence_index = await self.repo.next_sequence_index(thread.id) if thread is not None else 0
         task = await self.repo.create(
             user_id=payload.user_id,
             thread_id=thread.id if thread is not None else None,
@@ -454,6 +458,17 @@ class TaskService:
         await self.repo.bump_steps(task, run.turns_used)
         if run.errored:
             await self.repo.set_status(task, TaskStatus.failed, error=run.error, model=run.model)
+        elif run.completed and run.output_blocked:
+            # The agent finished, but the output wall withheld the result. Fail the task so API
+            # consumers don't read a withheld/unsafe run as a success; keep the safe placeholder
+            # as result_summary so the reason is still visible.
+            await self.repo.set_status(
+                task,
+                TaskStatus.failed,
+                result_summary=run.final_summary,
+                error="output guardrail withheld the result before delivery",
+                model=run.model,
+            )
         elif run.completed:
             await self.repo.set_status(
                 task,

@@ -16,7 +16,12 @@ async def _explode(_args, _ctx):
 
 
 def _make_tool(name, handler):
-    return Tool(name=name, description=name, parameters={"type": "object"}, handler=handler)
+    return Tool(
+        name=name,
+        description=name,
+        input_schema={"type": "object", "additionalProperties": False},
+        executor=handler,
+    )
 
 
 async def test_registry_invoke_success():

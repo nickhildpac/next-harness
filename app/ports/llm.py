@@ -4,12 +4,6 @@ from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
-class ChatMessage:
-    role: str
-    content: str
-
-
-@dataclass(frozen=True)
 class GenerationParams:
     model: str
     temperature: float
@@ -24,6 +18,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
+    strict: bool = True
 
 
 @dataclass(frozen=True)
@@ -33,6 +28,24 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolChoice:
+    """How the model should be constrained to use tools on a given turn."""
+
+    mode: str  # "auto" | "none" | "required" | "force"
+    tool_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    role: str
+    content: str
+    # Present on assistant messages that made native tool calls.
+    tool_calls: tuple[ToolCall, ...] | None = None
+    # Present on role="tool" messages, linking the result back to its call.
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,7 +66,21 @@ class LLMClient(Protocol):
         """The model this client will actually use for the given params."""
         ...
 
-    async def chat(self, messages: list[ChatMessage], params: GenerationParams) -> LLMResult:
+    def supports_native_tools(self) -> bool:
+        """Whether this client can take ``tools``/``tool_choice`` in ``chat`` and return
+        structured ``LLMResult.tool_calls`` instead of relying on the fenced-JSON text
+        protocol. Adapters that don't override this default to False.
+        """
+        return False
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        params: GenerationParams,
+        *,
+        tools: list[ToolSpec] | None = None,
+        tool_choice: ToolChoice | None = None,
+    ) -> LLMResult:
         ...
 
     async def stream_chat(

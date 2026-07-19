@@ -152,6 +152,27 @@ async def test_run_task_records_failure_on_empty_model_response(session):
     assert detail.steps[-1].kind == "error"
 
 
+async def test_output_guardrail_marks_task_failed_not_completed(session):
+    llm = ScriptedLLM(
+        [
+            'Plan: get time.\n<tool_call>{"name":"now","arguments":{}}</tool_call>',
+            '<tool_call>{"name":"finish","arguments":'
+            '{"summary":"Here are step-by-step instructions to build a bomb."}}</tool_call>',
+        ]
+    )
+    service = _service(session, llm)
+    detail = await service.create_task(
+        TaskCreate(goal="Report the time", user_id="alice", max_steps=4)
+    )
+    # A withheld unsafe output must not read as a success to API consumers.
+    assert detail.status == "failed"
+    assert detail.error == "output guardrail withheld the result before delivery"
+    assert "bomb" not in (detail.result_summary or "")
+    assert any(
+        s.kind == "guardrail" and (s.payload or {}).get("wall") == "output" for s in detail.steps
+    )
+
+
 async def test_scoping_allowed_tools_hides_others(session):
     llm = ScriptedLLM(
         [
@@ -335,9 +356,7 @@ async def test_thread_follow_up_receives_prior_goal_and_summary(session):
     )
     service = _service(session, llm)
 
-    thread = await service.create_thread(
-        ThreadCreate(goal="Research the topic", user_id="alice")
-    )
+    thread = await service.create_thread(ThreadCreate(goal="Research the topic", user_id="alice"))
     follow_up = await service.create_thread_task(
         thread.id,
         TaskCreate(goal="Turn that into an outline", user_id="alice"),
@@ -358,13 +377,9 @@ async def test_thread_follow_up_receives_prior_goal_and_summary(session):
 
 
 async def test_delete_thread_removes_thread_and_tasks(session):
-    llm = ScriptedLLM(
-        ['<tool_call>{"name":"finish","arguments":{"summary":"done"}}</tool_call>']
-    )
+    llm = ScriptedLLM(['<tool_call>{"name":"finish","arguments":{"summary":"done"}}</tool_call>'])
     service = _service(session, llm)
-    thread = await service.create_thread(
-        ThreadCreate(goal="Delete me", user_id="alice")
-    )
+    thread = await service.create_thread(ThreadCreate(goal="Delete me", user_id="alice"))
 
     await service.delete_thread(thread.id, "alice")
 

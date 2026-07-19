@@ -33,18 +33,79 @@ class ToolContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-ToolHandler = Callable[[dict[str, Any], ToolContext], Awaitable[Any]]
+ToolExecutor = Callable[[dict[str, Any], ToolContext], Awaitable[Any]]
+
+_VALID_JSON_SCHEMA_TYPES = {
+    "object",
+    "array",
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "null",
+}
 
 
-@dataclass(frozen=True)
+def validate_input_schema(schema: dict[str, Any], *, strict: bool = False) -> None:
+    """Reject malformed tool input schemas early, at registration time.
+
+    Only checks the shape conventions this codebase relies on (object schema
+    with a properties map and a required list drawn from those properties),
+    not full JSON Schema compliance. When ``strict`` is set, also enforces the
+    stricter shape OpenAI's structured-output mode requires: every declared
+    property must be listed as required (use a nullable type for genuinely
+    optional fields) and ``additionalProperties`` must be ``False``.
+    """
+    if not isinstance(schema, dict):
+        raise ValueError("input_schema must be a dict")
+    schema_type = schema.get("type")
+    if schema_type is not None and schema_type not in _VALID_JSON_SCHEMA_TYPES:
+        raise ValueError(f"input_schema has unknown type '{schema_type}'")
+    properties = schema.get("properties")
+    if properties is not None:
+        if not isinstance(properties, dict):
+            raise ValueError("input_schema.properties must be a dict")
+        for prop_name, prop_schema in properties.items():
+            if not isinstance(prop_name, str):
+                raise ValueError("input_schema.properties keys must be strings")
+            if not isinstance(prop_schema, dict):
+                raise ValueError(f"input_schema.properties.{prop_name} must be a dict")
+    required = schema.get("required")
+    if required is not None:
+        if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
+            raise ValueError("input_schema.required must be a list of strings")
+        known = set((properties or {}).keys())
+        unknown = [r for r in required if r not in known]
+        if unknown:
+            raise ValueError(f"input_schema.required references unknown properties: {unknown}")
+    if strict:
+        if schema.get("additionalProperties") is not False:
+            raise ValueError("strict input_schema must set additionalProperties: False")
+        known = set((properties or {}).keys())
+        missing = sorted(known - set(required or []))
+        if missing:
+            raise ValueError(f"strict input_schema must require every property: {missing}")
+
+
+@dataclass
 class Tool:
     name: str
     description: str
-    parameters: dict[str, Any]
-    handler: ToolHandler
+    input_schema: dict[str, Any]
+    executor: ToolExecutor
+    consequential: bool = False
+    strict: bool = True
+
+    def __post_init__(self) -> None:
+        validate_input_schema(self.input_schema, strict=self.strict)
 
     def spec(self) -> ToolSpec:
-        return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
+        return ToolSpec(
+            name=self.name,
+            description=self.description,
+            parameters=self.input_schema,
+            strict=self.strict,
+        )
 
 
 @dataclass(frozen=True)
@@ -102,7 +163,7 @@ class ToolRegistry:
                 name=name, call_id=call_id, ok=False, output=None, error=f"unknown tool '{name}'"
             )
         try:
-            output = await tool.handler(arguments or {}, context)
+            output = await tool.executor(arguments or {}, context)
         except ToolError as exc:
             return ToolResult(name=name, call_id=call_id, ok=False, output=None, error=str(exc))
         except Exception as exc:  # noqa: BLE001 — surfaced to the model as an error
@@ -120,4 +181,4 @@ def build_default_registry() -> ToolRegistry:
     """Register the built-in tools available to every agent run."""
     from app.tools import builtins
 
-    return ToolRegistry(builtins.all_tools())
+    return ToolRegistry(builtins.REGISTRY)

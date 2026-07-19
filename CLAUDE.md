@@ -50,11 +50,24 @@ routes/ → services/ → orchestration/ (LangGraph) → ports/ ← adapters/
   tool manifest into a system prompt and parses `<tool_call>{...}</tool_call>` JSON blocks out of
   assistant text — that fenced-JSON contract is how tools work with every adapter, no
   provider-native tool API required.
-- **`app/orchestration/agent_graph.py`** — LangGraph loop with two nodes: `reason` (LLM turn) →
-  `act` (dispatch tool calls via `ToolInvoker`) → `reason` again. Exits when the model emits
-  `finish`, produces a reply with no tool calls, or hits `max_steps`. Production runs use an MCP
-  Streamable HTTP client (`HybridToolInvoker`: local `finish`, other tools via the mounted
-  `/mcp` endpoint). Cursor still uses stdio (`python -m app.mcp` via `.cursor/mcp.json`).
+- **`app/orchestration/agent_graph.py`** — LangGraph loop wrapped by two guardrail nodes:
+  `guard_input` → `reason` (LLM turn) → `act` (dispatch tool calls via `ToolInvoker`) → `reason`
+  again → `guard_output`. Exits when the model emits `finish`, produces a reply with no tool
+  calls, or hits `max_steps`. Production runs use an MCP Streamable HTTP client
+  (`HybridToolInvoker`: local `finish`, other tools via the mounted `/mcp` endpoint). Cursor still
+  uses stdio (`python -m app.mcp` via `.cursor/mcp.json`).
+- **`app/guardrails/`** — the two walls around every task run (`GUARDRAILS_ENABLED`, default on).
+  `guard_input` runs `Guardrails.check_input` on **every piece of input the model reads — the goal
+  and the thread-history context** — **before the LLM sees it**: prompt injection blocks the run
+  (task fails with an `input guardrail blocked <source>` error); PII is redacted to placeholders so
+  the model only ever sees sanitized text. `guard_output` runs `Guardrails.check_output` on
+  `final_summary` **before the user sees it**: unsafe content or leaked secrets are withheld
+  (summary replaced with a safe message, `AgentRun.output_blocked=True`); PII is redacted. A withheld
+  output finalizes the task as **`failed`** with error `output guardrail withheld the result before
+  delivery` (the safe message stays as `result_summary`), so API consumers never read a blocked run
+  as a success. Findings surface as `guardrail` steps (a `TaskStepKind`) in the trace — clean runs
+  emit none. Detection is regex-based; both walls always run, but only add steps when they catch
+  something.
 - **`app/orchestration/chat_graph.py`** — the older single-node LLM wrapper, retained for the chat
   surface.
 - **`app/services/tasks.py`** — `TaskService` creates an `AgentTask`, runs the loop against a

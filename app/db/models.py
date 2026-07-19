@@ -184,6 +184,7 @@ class TaskStepKind(str, Enum):
     tool_result = "tool_result"
     final = "final"
     error = "error"
+    guardrail = "guardrail"
 
 
 class AgentThread(Base, IdMixin, TimestampMixin):

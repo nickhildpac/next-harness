@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator
 
 from app.orchestration.agent_graph import AgentGraph
-from app.ports.llm import ChatMessage, GenerationParams, LLMResult
+from app.ports.llm import ChatMessage, GenerationParams, LLMResult, ToolCall
 from app.tools.registry import Tool, ToolContext, ToolRegistry
 
 
@@ -31,11 +31,60 @@ class ScriptedLLM:
         return True
 
 
+class NativeScriptedLLM:
+    """Fake OpenAI-like client: replies with structured tool_calls instead of fenced text."""
+
+    def __init__(self, script: list[tuple[str, tuple[ToolCall, ...]]]):
+        self.script = list(script)
+        self.calls: list[list[ChatMessage]] = []
+        self.model = "native-scripted"
+
+    def resolve_model(self, params: GenerationParams) -> str:
+        return self.model
+
+    def supports_native_tools(self) -> bool:
+        return True
+
+    async def chat(
+        self,
+        messages: list[ChatMessage],
+        params: GenerationParams,
+        *,
+        tools=None,
+        tool_choice=None,
+    ) -> LLMResult:
+        self.calls.append(messages)
+        if not self.script:
+            raise AssertionError("scripted LLM ran out of replies")
+        content, tool_calls = self.script.pop(0)
+        return LLMResult(
+            content=content,
+            model=self.model,
+            input_tokens=1,
+            output_tokens=2,
+            tool_calls=tool_calls,
+        )
+
+    async def stream_chat(
+        self, messages: list[ChatMessage], params: GenerationParams
+    ) -> AsyncIterator[str]:  # pragma: no cover — not used in agent tests
+        if False:
+            yield ""
+
+    async def health(self) -> bool:
+        return True
+
+
 async def _make_echo_tool():
     async def echo(args, ctx):
         return {"seen": args}
 
-    return Tool(name="echo", description="Echo args", parameters={"type": "object"}, handler=echo)
+    return Tool(
+        name="echo",
+        description="Echo args",
+        input_schema={"type": "object", "additionalProperties": False},
+        executor=echo,
+    )
 
 
 async def _make_finish_tool():
@@ -45,8 +94,8 @@ async def _make_finish_tool():
     return Tool(
         name="finish",
         description="finish the task",
-        parameters={"type": "object"},
-        handler=finish,
+        input_schema={"type": "object", "additionalProperties": False},
+        executor=finish,
     )
 
 
@@ -218,8 +267,8 @@ async def test_agent_retries_when_model_falsely_claims_no_tool():
             Tool(
                 name="list_notes",
                 description="List notes",
-                parameters={"type": "object"},
-                handler=list_notes,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=list_notes,
             ),
             await _make_finish_tool(),
         ]
@@ -262,20 +311,20 @@ async def test_agent_retries_notes_summary_goal_without_tool_calls():
             Tool(
                 name="list_notes",
                 description="List notes",
-                parameters={"type": "object"},
-                handler=list_notes,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=list_notes,
             ),
             Tool(
                 name="get_note",
                 description="Get note",
-                parameters={"type": "object"},
-                handler=get_note,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=get_note,
             ),
             Tool(
                 name="create_note",
                 description="Create note",
-                parameters={"type": "object"},
-                handler=create_note,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=create_note,
             ),
             await _make_finish_tool(),
         ]
@@ -330,20 +379,20 @@ async def test_agent_notes_summary_empty_responses_do_not_complete_without_outpu
             Tool(
                 name="list_notes",
                 description="List notes",
-                parameters={"type": "object"},
-                handler=list_notes,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=list_notes,
             ),
             Tool(
                 name="get_note",
                 description="Get note",
-                parameters={"type": "object"},
-                handler=get_note,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=get_note,
             ),
             Tool(
                 name="create_note",
                 description="Create note",
-                parameters={"type": "object"},
-                handler=create_note,
+                input_schema={"type": "object", "additionalProperties": False},
+                executor=create_note,
             ),
             await _make_finish_tool(),
         ]
@@ -367,3 +416,45 @@ async def test_agent_notes_summary_empty_responses_do_not_complete_without_outpu
         message.content for message in llm.calls[1]
     )
     assert "previous response was empty" in "\n".join(message.content for message in llm.calls[2])
+
+
+async def test_agent_uses_native_tool_calls_when_supported():
+    """With a native-tool-calling LLM, no <tool_call> manifest text is used at all."""
+    llm = NativeScriptedLLM(
+        [
+            ("", (ToolCall(name="echo", arguments={"x": 1}, call_id="call_1"),)),
+            (
+                "",
+                (ToolCall(name="finish", arguments={"summary": "echoed once"}, call_id="call_2"),),
+            ),
+        ]
+    )
+    graph = AgentGraph(llm, await _registry(), max_steps=5)
+
+    assert "<tool_call>" not in graph.system_prompt()
+
+    run = await graph.run("test goal", _params(), ToolContext())
+    assert run.completed is True
+    assert run.final_summary == "echoed once"
+    kinds = [s.kind for s in run.steps]
+    assert kinds == ["tool_call", "tool_result", "tool_call", "tool_result", "final"]
+
+    # Second reasoning turn's history must carry a matching tool-role reply for call_1.
+    second_turn_messages = llm.calls[1]
+    tool_replies = [m for m in second_turn_messages if m.role == "tool"]
+    assert len(tool_replies) == 1
+    assert tool_replies[0].tool_call_id == "call_1"
+
+
+async def test_agent_native_implicit_finish_without_tool_calls():
+    llm = NativeScriptedLLM(
+        [
+            ("", (ToolCall(name="echo", arguments={"x": 1}, call_id="call_1"),)),
+            ("There are two saved translations: Russian and Korean.", ()),
+        ]
+    )
+    graph = AgentGraph(llm, await _registry(), max_steps=5)
+    run = await graph.run("list my translations", _params(), ToolContext())
+    assert run.completed is True
+    assert run.errored is False
+    assert run.final_summary == "There are two saved translations: Russian and Korean."

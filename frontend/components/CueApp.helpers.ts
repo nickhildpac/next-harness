@@ -171,6 +171,7 @@ export function taskStepLabel(step: TaskStep) {
   if (step.kind === "tool_result") return "Tool result";
   if (step.kind === "final") return "Final answer";
   if (step.kind === "error") return "Error";
+  if (step.kind === "guardrail") return "Guardrail";
   return step.kind;
 }
 
@@ -178,6 +179,10 @@ export function taskStepDetail(step: TaskStep) {
   if (step.kind === "tool_call" && step.tool_name) return `Calling ${step.tool_name}`;
   if (step.kind === "tool_result" && step.tool_name) {
     return step.ok === false ? `${step.tool_name} failed` : `${step.tool_name} returned`;
+  }
+  if (step.kind === "guardrail" && step.payload && typeof step.payload === "object") {
+    const p = step.payload as { wall?: string; action?: string };
+    if (p.wall && p.action) return `${p.wall} wall · ${p.action}`;
   }
   return step.tool_name || "";
 }

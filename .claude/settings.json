@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(pytest *)",
+      "Bash(npx tsc --noEmit *)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(curl -s http://localhost:*)",
+      "Bash(ruff check *)",
+      "Bash(docker compose -f infra/compose/docker-compose.yml config *)",
+      "Bash(python -m pytest *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/ruff check *)",
+      "Bash(docker compose -f infra/compose/docker-compose.yml ps *)",
+      "Bash(pip show *)",
+      "Bash(uvicorn app.main:app *)"
+    ]
+  }
+}

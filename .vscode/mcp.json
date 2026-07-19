@@ -6,7 +6,7 @@
 		"args": ["-m", "app.mcp"],
 		"cwd": "${workspaceFolder}",
 		"env": {
-			"MCP_USER_ID": "8839d7de-f7e8-4126-859b-6d53ccfc6e81"
+			"MCP_USER_ID": "613b0e38-225b-42e0-8da5-00b428059c95"
 		}
 		}
   }

@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from app.mcp.identity import TASK_SCOPED_TOOLS, USER_SCOPED_TOOLS
 from app.ports.llm import ToolSpec
-from app.tools.builtins import all_tools
+from app.tools.builtins import REGISTRY
 from app.tools.registry import Tool, ToolContext, ToolError, ToolResult
 
 
@@ -23,7 +23,7 @@ class McpToolTransport(Protocol):
 
 
 def _finish_tool() -> Tool:
-    for tool in all_tools():
+    for tool in REGISTRY:
         if tool.name == "finish":
             return tool
     raise RuntimeError("finish tool is missing from builtins")
@@ -117,7 +117,7 @@ class HybridToolInvoker:
         call_id: str | None,
     ) -> ToolResult:
         try:
-            output = await tool.handler(arguments or {}, context)
+            output = await tool.executor(arguments or {}, context)
         except ToolError as exc:
             return ToolResult(
                 name=tool.name, call_id=call_id, ok=False, output=None, error=str(exc)

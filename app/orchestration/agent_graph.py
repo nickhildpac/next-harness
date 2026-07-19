@@ -1,21 +1,36 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph, add_messages
 
-from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall
+from app.guardrails import SAFE_OUTPUT_REPLACEMENT, GuardrailResult, Guardrails
+from app.ports.llm import ChatMessage, GenerationParams, LLMClient, ToolCall, ToolChoice
 from app.ports.tools import ToolInvoker
 from app.tools.protocol import format_tool_result, parse_tool_calls, render_tool_manifest
 from app.tools.registry import ToolContext, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_native_tools(llm: LLMClient) -> bool:
+    # Duck-typed rather than a direct attribute access: fakes/stubs used in tests implement
+    # LLMClient structurally without subclassing it, so they don't inherit the Protocol default.
+    probe = getattr(llm, "supports_native_tools", None)
+    return bool(probe()) if callable(probe) else False
 
 
 AGENT_SYSTEM_PREAMBLE = (
@@ -32,7 +47,7 @@ AGENT_SYSTEM_PREAMBLE = (
 
 @dataclass
 class StepRecord:
-    kind: Literal["thought", "tool_call", "tool_result", "final", "error"]
+    kind: Literal["thought", "tool_call", "tool_result", "final", "error", "guardrail"]
     tool_name: str | None = None
     content: str | None = None
     payload: dict | list | None = None
@@ -50,6 +65,9 @@ class AgentRun:
     model: str | None = None
     steps: list[StepRecord] = field(default_factory=list)
     turns_used: int = 0
+    # Set when the output wall withheld an unsafe/sensitive result. The run still
+    # completes, but final_summary is replaced with a safe placeholder.
+    output_blocked: bool = False
     # FIX #3: Track retry turns separately. One-shot retries (tool_refusal, required_tool,
     # empty_response) increment retry_turns; actual work increments turns_used. Step limit
     # applies to turns_used only, not retry turns (retries are free corrections).
@@ -67,6 +85,9 @@ class _AgentState(TypedDict, total=False):
     work_turn: int
     params: GenerationParams
     context: "ToolContext"
+    # Prior thread summaries handed to the run. Held here (not pre-seeded into messages)
+    # so the input wall can sanitize it in guard_input before the model sees it.
+    prior_context: str | None
     pending_calls: list[ToolCall]
     retry_reason: bool
     tool_refusal_retried: bool
@@ -77,27 +98,47 @@ class _AgentState(TypedDict, total=False):
 class AgentGraph:
     """LangGraph loop: reason → (optional) tool_calls → observe, repeated until done."""
 
-    def __init__(self, llm: LLMClient, tools: ToolInvoker, max_steps: int):
+    def __init__(
+        self,
+        llm: LLMClient,
+        tools: ToolInvoker,
+        max_steps: int,
+        *,
+        guardrails: Guardrails | None = None,
+    ):
         self.llm = llm
         self.tools = tools
         self.max_steps = max_steps
+        # Nothing passes unchecked: default to active guardrails when none is supplied.
+        self.guardrails = guardrails or Guardrails()
         graph: StateGraph = StateGraph(_AgentState)
+        graph.add_node("guard_input", self._guard_input)
         graph.add_node("reason", self._reason)
         graph.add_node("act", self._act)
-        graph.set_entry_point("reason")
+        graph.add_node("guard_output", self._guard_output)
+        graph.set_entry_point("guard_input")
+        graph.add_conditional_edges(
+            "guard_input",
+            self._route_after_guard_input,
+            {"reason": "reason", "end": END},
+        )
         graph.add_conditional_edges(
             "reason",
             self._route_after_reason,
-            {"act": "act", "reason": "reason", "end": END},
+            {"act": "act", "reason": "reason", "guard_output": "guard_output", "end": END},
         )
         graph.add_conditional_edges(
             "act",
             self._route_after_act,
-            {"reason": "reason", "end": END},
+            {"reason": "reason", "guard_output": "guard_output", "end": END},
         )
+        graph.add_edge("guard_output", END)
         self.graph = graph.compile()
 
     def system_prompt(self) -> str:
+        if _supports_native_tools(self.llm):
+            # Tools are advertised to the model via the API's native tools= field, not text.
+            return AGENT_SYSTEM_PREAMBLE
         return f"{AGENT_SYSTEM_PREAMBLE}\n\n{render_tool_manifest(self.tools.specs())}"
 
     def _initial_state(
@@ -109,13 +150,9 @@ class AgentGraph:
         prior_context: str | None = None,
     ) -> tuple[AgentRun, _AgentState]:
         run = AgentRun(goal=goal)
+        # The goal AND thread-history messages are appended by the guard_input node so the
+        # LLM only ever sees sanitized input (or nothing, if the input wall blocks the run).
         messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt())]
-        if prior_context:
-            messages.append(HumanMessage(content=f"Thread history:\n{prior_context}"))
-        messages.append(HumanMessage(content=f"Goal: {goal}"))
-        goal_hint = self._goal_tool_hint(goal, metadata=context.metadata)
-        if goal_hint:
-            messages.append(HumanMessage(content=goal_hint))
         state: _AgentState = {
             "run": run,
             "messages": messages,
@@ -123,6 +160,7 @@ class AgentGraph:
             "work_turn": 0,  # FIX #3: Only incremented for non-retry reasoning turns.
             "params": params,
             "context": context,
+            "prior_context": prior_context,
             "pending_calls": [],
             "retry_reason": False,
             "tool_refusal_retried": False,
@@ -174,6 +212,85 @@ class AgentGraph:
         get_stream_writer()(step)
         return step
 
+    def _emit_guardrail_findings(self, run: AgentRun, wall: str, result: GuardrailResult) -> None:
+        # Only surface a step when a wall actually caught something, so clean runs keep a
+        # tidy trace (and the step sequence tests rely on) while flagged runs stay auditable.
+        for finding in result.findings:
+            self._emit_step(
+                run,
+                StepRecord(
+                    kind="guardrail",
+                    content=(
+                        f"{wall} guardrail {finding.action} {finding.category}: {finding.detail}"
+                    ),
+                    payload={
+                        "wall": wall,
+                        "category": finding.category,
+                        "detail": finding.detail,
+                        "action": finding.action,
+                    },
+                    ok=finding.action != "blocked",
+                ),
+            )
+
+    def _block_input(self, run: AgentRun, source: str, result: GuardrailResult) -> None:
+        run.errored = True
+        run.error = f"input guardrail blocked {source}: {result.blocked_reason}"
+        self._emit_step(run, StepRecord(kind="error", content=run.error))
+
+    async def _guard_input(self, state: _AgentState) -> _AgentState:
+        """Wall 1: sanitize every piece of input (thread history and goal) before it reaches
+        the model; block on prompt injection."""
+        run = state["run"]
+        context = state["context"]
+        messages_to_add: list[BaseMessage] = []
+
+        # Thread history is input the model reads, so it passes through the same wall as the
+        # goal: PII is redacted and prompt injection blocks the run before the model sees it.
+        prior_context = state.get("prior_context")
+        if prior_context:
+            history = self.guardrails.check_input(prior_context)
+            self._emit_guardrail_findings(run, "input:thread_history", history)
+            if not history.allowed:
+                self._block_input(run, "thread history", history)
+                state["messages"] = []
+                return state
+            messages_to_add.append(HumanMessage(content=f"Thread history:\n{history.text}"))
+
+        result = self.guardrails.check_input(run.goal)
+        self._emit_guardrail_findings(run, "input", result)
+        if not result.allowed:
+            self._block_input(run, "goal", result)
+            state["messages"] = []
+            return state
+        messages_to_add.append(HumanMessage(content=f"Goal: {result.text}"))
+        goal_hint = self._goal_tool_hint(result.text, metadata=context.metadata)
+        if goal_hint:
+            messages_to_add.append(HumanMessage(content=goal_hint))
+        state["messages"] = messages_to_add
+        return state
+
+    async def _guard_output(self, state: _AgentState) -> _AgentState:
+        """Wall 2: withhold unsafe/secret results and redact PII before the user sees them."""
+        run = state["run"]
+        result = self.guardrails.check_output(run.final_summary or "")
+        self._emit_guardrail_findings(run, "output", result)
+        if not result.allowed:
+            run.output_blocked = True
+            run.final_summary = SAFE_OUTPUT_REPLACEMENT
+            self._emit_step(
+                run,
+                StepRecord(
+                    kind="error",
+                    content=f"output guardrail blocked: {result.blocked_reason}",
+                ),
+            )
+        elif result.redacted:
+            run.final_summary = result.text
+        # No message delta: this node only rewrites the result and emits steps.
+        state["messages"] = []
+        return state
+
     async def _reason(self, state: _AgentState) -> _AgentState:
         run = state["run"]
         params = state["params"]
@@ -186,25 +303,45 @@ class AgentGraph:
             run.turns_used = state["work_turn"]
         else:
             run.retry_turns = run.retry_turns + 1
-        result = await self.llm.chat(self._to_port_messages(state["messages"]), params)
+        native = _supports_native_tools(self.llm)
+        port_messages = self._to_port_messages(state["messages"])
+        if native:
+            result = await self.llm.chat(
+                port_messages,
+                params,
+                tools=self.tools.specs(),
+                tool_choice=ToolChoice(mode="auto"),
+            )
+        else:
+            result = await self.llm.chat(port_messages, params)
         run.model = result.model
         content = result.content or ""
-        parsed = parse_tool_calls(content)
+        if native:
+            thought = content.strip()
+            tool_calls = result.tool_calls
+        else:
+            parsed = parse_tool_calls(content)
+            thought = parsed.thought
+            tool_calls = parsed.tool_calls
         # FIX #5: Return message updates instead of mutating state in place.
-        messages_to_add: list[BaseMessage] = [AIMessage(content=content)]
-        if parsed.thought:
-            self._emit_step(run, StepRecord(kind="thought", content=parsed.thought))
+        messages_to_add: list[BaseMessage] = [self._build_assistant_message(content, tool_calls)]
+        if thought:
+            self._emit_step(run, StepRecord(kind="thought", content=thought))
 
-        if not parsed.tool_calls:
+        if not tool_calls:
             if self._should_retry_false_tool_refusal(content, state):
                 state["tool_refusal_retried"] = True
                 state["retry_reason"] = True
+                correction = (
+                    "Call the appropriate tool."
+                    if native
+                    else "For this task, call the appropriate tool using a <tool_call> block."
+                )
                 messages_to_add.append(
                     HumanMessage(
                         content=(
                             "Correction: you do have access to the listed tools. "
-                            "For this task, call the appropriate tool using a <tool_call> block. "
-                            f"Available tools: {', '.join(self.tools.names())}."
+                            f"{correction} Available tools: {', '.join(self.tools.names())}."
                         )
                     )
                 )
@@ -220,11 +357,16 @@ class AgentGraph:
             if self._should_retry_empty_response(content, state):
                 state["empty_response_retried"] = True
                 state["retry_reason"] = True
+                required_tool = (
+                    "call the required tool"
+                    if native
+                    else "call the required tool using a <tool_call> block"
+                )
                 messages_to_add.append(
                     HumanMessage(
                         content=(
                             "Correction: your previous response was empty. "
-                            "Either call the required tool using a <tool_call> block, "
+                            f"Either {required_tool}, "
                             "or provide a non-empty final answer if the task is already complete."
                         )
                     )
@@ -238,7 +380,7 @@ class AgentGraph:
                 state["pending_calls"] = []
                 state["messages"] = messages_to_add
                 return state
-            summary = parsed.thought or content.strip()
+            summary = thought or content.strip()
             # FIX #7: If the agent already ran a tool successfully, a non-empty answer with no
             # further tool calls is an implicit finish (the model gathered data and reported it),
             # not a refusal. Treat it as completion so, e.g., "list my translations" doesn't fail
@@ -260,7 +402,7 @@ class AgentGraph:
             state["messages"] = messages_to_add
             return state
 
-        state["pending_calls"] = list(parsed.tool_calls)
+        state["pending_calls"] = list(tool_calls)
         state["messages"] = messages_to_add
         return state
 
@@ -268,6 +410,7 @@ class AgentGraph:
         run = state["run"]
         context = state["context"]
         pending = state.get("pending_calls", [])
+        native = _supports_native_tools(self.llm)
         tool_results: list[ToolResult] = []
         for call in pending:
             self._emit_step(
@@ -308,11 +451,23 @@ class AgentGraph:
                 # Break early: don't execute remaining pending calls after finish succeeds.
                 break
 
-        observation = "\n".join(
-            format_tool_result(r.name, r.call_id, r.output, r.error) for r in tool_results
-        )
         # FIX #5: Return message updates instead of mutating state in place.
-        state["messages"] = [HumanMessage(content=f"Tool results:\n{observation}")]
+        if native:
+            # Each native tool call needs its own tool-role reply, paired by call_id, so the
+            # next turn's message history is valid for the provider's tool-calling API.
+            state["messages"] = [
+                ToolMessage(
+                    content=json.dumps(r.output if r.ok else {"error": r.error}, default=str),
+                    tool_call_id=r.call_id or "",
+                    name=r.name,
+                )
+                for r in tool_results
+            ]
+        else:
+            observation = "\n".join(
+                format_tool_result(r.name, r.call_id, r.output, r.error) for r in tool_results
+            )
+            state["messages"] = [HumanMessage(content=f"Tool results:\n{observation}")]
         state["pending_calls"] = []
 
         # Emit step-limit here (not in the router) so custom stream clients see it.
@@ -327,9 +482,16 @@ class AgentGraph:
             )
         return state
 
+    def _route_after_guard_input(self, state: _AgentState) -> str:
+        # A blocked input marks the run errored; otherwise proceed to the first reason turn.
+        return "end" if state["run"].errored else "reason"
+
     def _route_after_reason(self, state: _AgentState) -> str:
         run = state["run"]
-        if run.completed or run.errored:
+        # A completed run always exits through the output wall before delivery.
+        if run.completed:
+            return "guard_output"
+        if run.errored:
             return "end"
         if state.get("retry_reason") and state["turn"] < self.max_steps:
             return "reason"
@@ -341,7 +503,10 @@ class AgentGraph:
 
     def _route_after_act(self, state: _AgentState) -> str:
         run = state["run"]
-        if run.completed or run.errored or run.step_limit_hit:
+        # A completed run always exits through the output wall before delivery.
+        if run.completed:
+            return "guard_output"
+        if run.errored or run.step_limit_hit:
             return "end"
         return "reason"
 
@@ -433,17 +598,46 @@ class AgentGraph:
             return None
         return max(1, min(int(match.group(1)), 20))
 
+    @staticmethod
+    def _build_assistant_message(content: str, tool_calls: tuple[ToolCall, ...]) -> AIMessage:
+        if not tool_calls:
+            return AIMessage(content=content)
+        return AIMessage(
+            content=content,
+            tool_calls=[
+                {
+                    "name": call.name,
+                    "args": call.arguments,
+                    "id": call.call_id or f"call_{i}",
+                    "type": "tool_call",
+                }
+                for i, call in enumerate(tool_calls)
+            ],
+        )
+
     def _to_port_messages(self, messages: list[BaseMessage]) -> list[ChatMessage]:
-        return [
-            ChatMessage(role=self._message_role(message), content=self._message_content(message))
-            for message in messages
-        ]
+        return [self._to_port_message(message) for message in messages]
+
+    def _to_port_message(self, message: BaseMessage) -> ChatMessage:
+        role = self._message_role(message)
+        content = self._message_content(message)
+        if isinstance(message, ToolMessage):
+            return ChatMessage(role=role, content=content, tool_call_id=message.tool_call_id)
+        if isinstance(message, AIMessage) and message.tool_calls:
+            tool_calls = tuple(
+                ToolCall(name=tc["name"], arguments=tc.get("args") or {}, call_id=tc.get("id"))
+                for tc in message.tool_calls
+            )
+            return ChatMessage(role=role, content=content, tool_calls=tool_calls)
+        return ChatMessage(role=role, content=content)
 
     def _message_role(self, message: BaseMessage) -> str:
         if isinstance(message, SystemMessage):
             return "system"
         if isinstance(message, AIMessage):
             return "assistant"
+        if isinstance(message, ToolMessage):
+            return "tool"
         return "user"
 
     def _message_content(self, message: BaseMessage) -> str:
@@ -453,7 +647,5 @@ class AgentGraph:
         # FIX #5: For multimodal content (list of dicts), serialize to JSON to avoid Python repr.
         # Currently only str messages are created, but this protects against future multimodal parts.
         if isinstance(content, list):
-            import json
-
             return json.dumps(content)
         return str(content)

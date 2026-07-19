@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     window_turn_count: int = 12
     custom_persona_max_chars: int = 800
 
+    # Agent guardrails: the input wall (prompt injection + PII) and output wall
+    # (unsafe content, leaked secrets, PII) around every task run.
+    guardrails_enabled: bool = True
+
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int | None = None
     chroma_persist_dir: str = "./var/chroma"

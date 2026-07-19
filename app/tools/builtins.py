@@ -314,163 +314,168 @@ async def _finish(args: dict[str, Any], _: ToolContext) -> dict[str, Any]:
     return {"summary": args.get("summary") or "done"}
 
 
-def all_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="now",
-            description="Return the current UTC time.",
-            parameters={"type": "object", "properties": {}, "additionalProperties": False},
-            handler=_now,
-        ),
-        Tool(
-            name="list_notes",
-            description="List markdown notes owned by the task user.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                },
-                "additionalProperties": False,
+REGISTRY: list[Tool] = [
+    Tool(
+        name="now",
+        description="Return the current UTC time.",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        executor=_now,
+    ),
+    Tool(
+        name="list_notes",
+        description="List markdown notes owned by the task user.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
             },
-            handler=_list_notes,
-        ),
-        Tool(
-            name="get_note",
-            description="Fetch a single note by id, including its full markdown content.",
-            parameters={
-                "type": "object",
-                "properties": {"note_id": {"type": "string"}},
-                "required": ["note_id"],
-                "additionalProperties": False,
+            "required": ["limit"],
+            "additionalProperties": False,
+        },
+        executor=_list_notes,
+    ),
+    Tool(
+        name="get_note",
+        description="Fetch a single note by id, including its full markdown content.",
+        input_schema={
+            "type": "object",
+            "properties": {"note_id": {"type": "string"}},
+            "required": ["note_id"],
+            "additionalProperties": False,
+        },
+        executor=_get_note,
+    ),
+    Tool(
+        name="create_note",
+        description="Persist a new markdown note for the task's user.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": ["string", "null"]},
+                "content": {"type": "string"},
+                "style_name": {"type": ["string", "null"]},
+                "custom_instructions": {"type": ["string", "null"]},
             },
-            handler=_get_note,
-        ),
-        Tool(
-            name="create_note",
-            description="Persist a new markdown note for the task's user.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "content": {"type": "string"},
-                    "style_name": {"type": "string"},
-                    "custom_instructions": {"type": "string"},
-                },
-                "required": ["content"],
-                "additionalProperties": False,
+            "required": ["title", "content", "style_name", "custom_instructions"],
+            "additionalProperties": False,
+        },
+        executor=_create_note,
+        consequential=True,
+    ),
+    Tool(
+        name="update_note",
+        description="Update a markdown note owned by the task user.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "note_id": {"type": "string"},
+                "title": {"type": ["string", "null"]},
+                "content": {"type": ["string", "null"]},
+                "style_name": {"type": ["string", "null"]},
+                "custom_instructions": {"type": ["string", "null"]},
             },
-            handler=_create_note,
-        ),
-        Tool(
-            name="update_note",
-            description="Update a markdown note owned by the task user.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "note_id": {"type": "string"},
-                    "title": {"type": "string"},
-                    "content": {"type": "string"},
-                    "style_name": {"type": "string"},
-                    "custom_instructions": {"type": "string"},
-                },
-                "required": ["note_id"],
-                "additionalProperties": False,
+            "required": ["note_id", "title", "content", "style_name", "custom_instructions"],
+            "additionalProperties": False,
+        },
+        executor=_update_note,
+        consequential=True,
+    ),
+    Tool(
+        name="list_translations",
+        description="List saved translations for the task user.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
             },
-            handler=_update_note,
-        ),
-        Tool(
-            name="list_translations",
-            description="List saved translations for the task user.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                },
-                "additionalProperties": False,
+            "required": ["limit"],
+            "additionalProperties": False,
+        },
+        executor=_list_translations,
+    ),
+    Tool(
+        name="translate_text",
+        description="Translate text for the task user and save the translation by default.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "source_text": {"type": "string"},
+                "target_language": {"type": "string"},
+                "save": {"type": ["boolean", "null"]},
             },
-            handler=_list_translations,
+            "required": ["source_text", "target_language", "save"],
+            "additionalProperties": False,
+        },
+        executor=_translate_text,
+        consequential=True,
+    ),
+    Tool(
+        name="ingest_task_document",
+        description=(
+            "Create a task-scoped RAG document from text or markdown content supplied in JSON."
         ),
-        Tool(
-            name="translate_text",
-            description="Translate text for the task user and save the translation by default.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "source_text": {"type": "string"},
-                    "target_language": {"type": "string"},
-                    "save": {"type": "boolean"},
-                },
-                "required": ["source_text", "target_language"],
-                "additionalProperties": False,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"},
+                "content": {"type": "string"},
+                "content_type": {"type": ["string", "null"]},
             },
-            handler=_translate_text,
+            "required": ["filename", "content", "content_type"],
+            "additionalProperties": False,
+        },
+        executor=_ingest_task_document,
+        consequential=True,
+    ),
+    Tool(
+        name="list_task_documents",
+        description="List RAG documents ingested for the current task.",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        executor=_list_task_documents,
+    ),
+    Tool(
+        name="search_task_documents",
+        description=(
+            "Search task-scoped RAG documents. Use this before answering questions that "
+            "depend on ingested document content."
         ),
-        Tool(
-            name="ingest_task_document",
-            description=(
-                "Create a task-scoped RAG document from text or markdown content supplied in JSON."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string"},
-                    "content": {"type": "string"},
-                    "content_type": {"type": "string"},
-                },
-                "required": ["filename", "content"],
-                "additionalProperties": False,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "token_budget": {"type": ["integer", "null"], "minimum": 1},
             },
-            handler=_ingest_task_document,
-        ),
-        Tool(
-            name="list_task_documents",
-            description="List RAG documents ingested for the current task.",
-            parameters={"type": "object", "properties": {}, "additionalProperties": False},
-            handler=_list_task_documents,
-        ),
-        Tool(
-            name="search_task_documents",
-            description=(
-                "Search task-scoped RAG documents. Use this before answering questions that "
-                "depend on ingested document content."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "token_budget": {"type": "integer", "minimum": 1},
-                },
-                "required": ["query"],
-                "additionalProperties": False,
+            "required": ["query", "token_budget"],
+            "additionalProperties": False,
+        },
+        executor=_search_task_documents,
+    ),
+    Tool(
+        name="http_fetch",
+        description="HTTP GET a URL and return the response body (truncated).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "max_bytes": {"type": ["integer", "null"], "minimum": 1, "maximum": 65536},
             },
-            handler=_search_task_documents,
+            "required": ["url", "max_bytes"],
+            "additionalProperties": False,
+        },
+        executor=_http_fetch,
+    ),
+    Tool(
+        name="finish",
+        description=(
+            "Mark the task as complete. Call this exactly once, at the end, with a short "
+            "user-facing summary of what was accomplished."
         ),
-        Tool(
-            name="http_fetch",
-            description="HTTP GET a URL and return the response body (truncated).",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536},
-                },
-                "required": ["url"],
-                "additionalProperties": False,
-            },
-            handler=_http_fetch,
-        ),
-        Tool(
-            name="finish",
-            description=(
-                "Mark the task as complete. Call this exactly once, at the end, with a short "
-                "user-facing summary of what was accomplished."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"],
-                "additionalProperties": False,
-            },
-            handler=_finish,
-        ),
-    ]
+        input_schema={
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+        executor=_finish,
+    ),
+]
